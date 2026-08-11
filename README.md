@@ -1,4 +1,4 @@
-# The task factory
+# The Factory
 
 Drains a queue of task packets: each one is implemented by a model in an
 isolated git worktree, verified by gates the harness runs itself, reviewed
