@@ -1,0 +1,12 @@
+# Line endings.
+#
+# Pin LF in the index *and* the working tree, rather than letting each
+# contributor's `core.autocrlf` renegotiate it on checkout. The harness is
+# stdlib Python, its prompts are markdown handed verbatim to a model, and it
+# parses CLI output line by line — none of that wants CRLF, and a vendored copy
+# should look the same on every machine that pulls it.
+* text=auto eol=lf
+
+# cmd.exe can mis-parse LF-only batch files (labels/goto), so these stay CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

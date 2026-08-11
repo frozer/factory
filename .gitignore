@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Factory state, when this repo is vendored into a project and run there.
+# Harmless here; listed so a copy carries the rule with it.
+.factory/
