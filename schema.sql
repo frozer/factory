@@ -20,7 +20,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     model         TEXT NOT NULL,             -- implementer tier
     reviewer      TEXT NOT NULL,             -- always >= model, minimum 'standard'
     gate          TEXT NOT NULL DEFAULT 'auto',   -- 'auto' | 'human'
+    -- Retired. Superseded by `extra_pytest_marker` below and kept only
+    -- because `db._migrate` can add a column and never drop one, for the same
+    -- reason `model` and `reviewer` keep their pre-tier names. Nothing reads it.
     needs_db      INTEGER NOT NULL DEFAULT 0,
+    -- A pytest marker to run as a second, separate invocation; '' for none.
+    -- Not "this task uses a database": it names a held-out subset of the suite,
+    -- and a project that holds none out has nothing to give it.
+    extra_pytest_marker TEXT NOT NULL DEFAULT '',
     surface       TEXT NOT NULL DEFAULT 'api',    -- 'api' | 'webapp'
     goal          TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL DEFAULT 'ready',

@@ -44,9 +44,11 @@ import contracts  # noqa: E402
 import gates  # noqa: E402
 import gitops  # noqa: E402
 import ground  # noqa: E402
+import packetlint  # noqa: E402
 from db import Factory, Task  # noqa: E402
 from db import now as db_now  # noqa: E402
 from packet import TIERS, Packet, PacketError, load_all  # noqa: E402
+from packet import already_landed  # noqa: E402
 from packet import is_packet_filename  # noqa: E402
 from packet import parse as packet_parse  # noqa: E402
 
@@ -105,6 +107,13 @@ class Config:
     # much further out since it's a fact, not a guess. See
     # agent.DEFAULT_MAX_PARSED_WAIT_S.
     max_parsed_wait_s: float = agent.DEFAULT_MAX_PARSED_WAIT_S
+    # The conventional-commit scope every merge is labelled with, or "" for none.
+    # Empty by default and for the same reason `target_branch` is not baked in: a
+    # scope is a fact about the project the harness is vendored into, and a scope
+    # baked in here labels every task any project ever merges with a name from
+    # some other repository's numbering. A wrong label is worse than no label,
+    # because it is the one a reader believes.
+    commit_scope: str = ""
 
 
 class Halt(RuntimeError):
@@ -301,13 +310,35 @@ def verify_command(pkt: Packet) -> str:
     commands are checked per segment, so the `cd` was denied and the worker
     burned three turns inventing shell workarounds for a command the packet had
     told it to run. `cd` is allowed now too, but not needing it is better.
+
+    **The `-m db` segment is omitted where the project registers no such
+    marker.** `prompts/implement.md` hands this command over with "fix what it
+    reports", and a segment that exits 5 on every run reports something the
+    worker cannot fix: registering a marker means editing the project's
+    `pyproject.toml`, which every packet that asks for a marker has in its
+    `forbidden_paths`. `gates.py` scores the same empty run `skipped` rather
+    than failing it; this is the other half, because a survivable gate still
+    leaves an impossible instruction, and a worker that cannot satisfy its
+    verification is a worker that does not finish.
     """
     if pkt.surface == "webapp":
         return "npm --prefix webapp run lint && npm --prefix webapp run build"
     cmd = "uv run --directory api ruff check . && uv run --directory api pytest -q"
-    if pkt.needs_db:
-        cmd += " && uv run --directory api pytest -q -m db"
+    marker = pkt.extra_pytest_marker
+    if marker and _marker_registered(marker):
+        cmd += f" && uv run --directory api pytest -q -m {marker}"
     return cmd
+
+
+def _marker_registered(marker: str) -> bool:
+    """Whether `-m <marker>` could select anything in this project.
+
+    `None` from `declared_markers` means the question could not be answered —
+    markers configured somewhere it does not read. The segment is kept in that
+    case, because the old behaviour is the safe one when nothing is known.
+    """
+    declared = gates.declared_markers(REPO / "api")
+    return declared is None or marker in declared
 
 
 def format_note(pkt: Packet) -> str:
@@ -372,7 +403,18 @@ def run_task(fac: Factory, pkt: Packet, task: Task, cfg: Config) -> str:
     run_dir.mkdir(parents=True, exist_ok=True)
     on_wait = _make_on_wait(fac, task.id)
 
-    drift = gitops.spec_moved(REPO, task.spec_commit, task.spec_path)
+    try:
+        drift = gitops.spec_moved(REPO, task.spec_commit, task.spec_path)
+    except gitops.GitError as exc:
+        # Blocked rather than raised: a bad pin is a defect in one packet, and
+        # taking the whole loop down would punish every other task in the queue.
+        fac.set_status(
+            task.id,
+            "blocked",
+            blocked_reason=f"spec of record cannot be read: {exc}",
+        )
+        fac.event("spec_unreadable", {"error": str(exc)}, task.id)
+        return "blocked"
     if drift:
         fac.set_status(
             task.id,
@@ -383,6 +425,20 @@ def run_task(fac: Factory, pkt: Packet, task: Task, cfg: Config) -> str:
             ),
         )
         fac.event("spec_drift", {"commits": drift}, task.id)
+        return "blocked"
+
+    landed = already_landed(pkt, REPO)
+    if landed:
+        fac.set_status(
+            task.id,
+            "blocked",
+            blocked_reason=(
+                "the work is already on the branch: "
+                + ", ".join(landed[:3])
+                + " exist and this packet is to create them"
+            ),
+        )
+        fac.event("already_landed", {"paths": landed}, task.id)
         return "blocked"
 
     fresh = not worktree.exists()
@@ -577,9 +633,22 @@ def _gate_and_review(
         surface=pkt.surface,
         changed=changed,
         tampered=tampered,
-        needs_db=pkt.needs_db,
+        extra_marker=pkt.extra_pytest_marker,
         baseline=baseline,
     )
+    # A gate that repaired formatting leaves the worktree dirty, and the attempt
+    # was committed before the gate ran. Fold the rewrite into the attempt's HEAD
+    # now: `is_dirty` further down is the meddling check, and an uncommitted
+    # rewrite would read as a human editing the worktree mid-review.
+    if result.autoformatted:
+        formatted_sha = gitops.commit_all(
+            worktree, f"style({task.id}): ruff format, applied by the gate"
+        )
+        if formatted_sha is not None:
+            head_sha = formatted_sha
+        fac.event("autoformatted", {"files": result.autoformatted}, task.id)
+        print(f"  gate formatted {len(result.autoformatted)} file(s); attempt not spent")
+
     (run_dir / "gate.json").write_text(result.to_json(), encoding="utf-8")
     fac.finish_attempt(
         attempt_id,
@@ -695,14 +764,89 @@ def _gate_and_review(
         )
         return "awaiting_human"
 
-    return _merge(fac, task, pkt, branch, worktree, cfg)
+    return _merge(fac, task, pkt, branch, worktree, cfg, attempt_id)
+
+
+
+#: `tasks/README.md` is the board, and the harness writes it — `cmd_run` and
+#: `cmd_resume` regenerate it, and `_merge` amends it into the merge commit. So it
+#: is dirty as a matter of course, and counting it as the operator's work
+#: deadlocked both `approve` and `resume`: the command that leaves it modified is
+#: the same one that then refuses over it, and committing it by hand lasts until
+#: the next regeneration.
+BOARD_REL = "tasks/README.md"
+
+
+def operator_dirty(repo: Path) -> list[str]:
+    """`git status --porcelain` entries the operator is responsible for.
+
+    Everything `is_dirty` reports except the board. The distinction matters
+    because the guards built on it refuse to merge over uncommitted work, and a
+    guard that fires on the harness's own bookkeeping stops the harness instead
+    of protecting anybody.
+    """
+    return [
+        entry
+        for entry in gitops.is_dirty(repo)
+        if not entry.split(maxsplit=1)[-1].strip().endswith(BOARD_REL)
+    ]
 
 
 def _merge(
-    fac: Factory, task: Task, pkt: Packet, branch: str, worktree: Path, cfg: Config
+    fac: Factory,
+    task: Task,
+    pkt: Packet,
+    branch: str,
+    worktree: Path,
+    cfg: Config,
+    attempt_id: int | None = None,
 ) -> str:
     fac.set_status(task.id, "merging")
-    message = f"feat(s3-3): {pkt.goal} [{task.id}]"
+
+    # The loop checks the repository is clean when it *claims*, and the merge
+    # happens an implementation, a gate and a review later. An operator working
+    # in the tree during that window is ordinary — and it costs a task a
+    # completed, green-gated, review-accepted attempt: `git merge --squash`
+    # refuses with "your local changes would be overwritten", the task goes to
+    # `needs_work`, and the next attempt re-does work that was already right.
+    #
+    # So this is checked here rather than discovered from a merge error, and it
+    # does not spend the task's budget. A dirty tree is the operator's state,
+    # not a defect in the work, and `max_attempts` is a budget for a model
+    # having a bad run.
+    # `tasks/README.md` is excluded because the harness writes it itself — every
+    # path that reaches here has just regenerated the board (`resume` at :1136,
+    # the loop at :2234), and this function amends that very file into the merge
+    # commit twenty lines below. Counting it as operator work deadlocked
+    # `approve`: resume leaves the board dirty, approve refuses over it, and
+    # committing it by hand only lasts until the next regeneration.
+    dirty = operator_dirty(REPO)
+    if dirty:
+        paths = [entry.split(maxsplit=1)[-1] for entry in dirty[:10]]
+        reason = (
+            f"merge onto {cfg.target_branch} was not attempted: the repository has "
+            "uncommitted changes that the merge would overwrite"
+        )
+        fac.event("merge_blocked_dirty_tree", {"paths": paths}, task.id)
+        if attempt_id is not None:
+            fac.revert_attempt(
+                task.id, attempt_id, reason, agent_status="merge_blocked"
+            )
+        fac.set_status(task.id, "needs_work", blocked_reason=reason)
+        print(
+            f"\n  {task.id} passed its gate and its review and was NOT merged: the "
+            "repository has uncommitted changes.\n"
+            + "".join(f"    {p}\n" for p in paths)
+            + "  The attempt was not counted against its budget. Commit or stash "
+            f"those, then:\n    ./factory/run.py resume {task.id}\n"
+            "  which re-gates the work already on its branch instead of building it "
+            "again.",
+            file=sys.stderr,
+        )
+        return "merge_blocked"
+
+    scope = f"({cfg.commit_scope})" if cfg.commit_scope else ""
+    message = f"feat{scope}: {pkt.goal} [{task.id}]"
     try:
         sha = gitops.squash_merge(REPO, branch, message)
     except gitops.GitError as exc:
@@ -792,7 +936,7 @@ def cmd_sync(fac: Factory, args) -> int:
     except PacketError as exc:
         print(f"packet error: {exc}", file=sys.stderr)
         return 2
-    refused: list[tuple[Packet, str]] = []
+    refused: list[tuple[Packet, str, str]] = []
     for i, pkt in enumerate(packets):
         existing = fac.get(pkt.id)
         # A task that already merged is grandfathered: its packet was vetted by
@@ -801,10 +945,27 @@ def cmd_sync(fac: Factory, args) -> int:
         # re-run anyway.
         settled = existing is not None and existing.status == "done"
         if not args.allow_unassessed and not settled:
-            assessed, why = load_assessment(pkt)
-            if assessed is None:
-                refused.append((pkt, why))
+            # Free checks first, on every packet. They cost milliseconds and
+            # catch the defect classes that dominated assessment's findings.
+            mechanical = packetlint.lint(pkt, REPO)
+            if mechanical:
+                refused.append((pkt, "; ".join(str(f) for f in mechanical), "edit"))
                 continue
+            # An assessment already on disk for this exact packet is honoured
+            # whatever the tier policy says. Skipping the requirement is a
+            # spend decision; ignoring a recorded verdict would be throwing
+            # away a finding somebody has already paid an assessment call for.
+            standing = standing_verdict(pkt)
+            if standing is not None and standing[0] != "ready":
+                refused.append(
+                    (pkt, f"assessed `{standing[0]}` — {standing[1]}", "assess")
+                )
+                continue
+            if standing is None and (args.assess_all or needs_model_assessment(pkt)):
+                assessed, why = load_assessment(pkt)
+                if assessed is None:
+                    refused.append((pkt, why, "assess"))
+                    continue
         outcome = fac.upsert_packet(pkt.to_meta(REPO), ordinal=i)
         marker = {"new": "+", "changed": "~", "unchanged": " "}[outcome]
         print(f" {marker} {pkt.id:<5} {pkt.tier:<8} {pkt.goal[:60]}")
@@ -838,13 +999,20 @@ def cmd_sync(fac: Factory, args) -> int:
             "worth running:",
             file=sys.stderr,
         )
-        for pkt, why in refused:
+        for pkt, why, kind in refused:
             print(f"  ✗ {pkt.id:<5} {why}", file=sys.stderr)
-            print(f"        ./factory/run.py assess {pkt.id}", file=sys.stderr)
+            if kind == "assess":
+                print(f"        ./factory/run.py assess {pkt.id}", file=sys.stderr)
+            else:
+                # A mechanical finding names its own remedy — the fix is an edit
+                # to the packet, and re-running sync re-checks it for free.
+                print(f"        edit {pkt.path.name}, then sync again", file=sys.stderr)
         print(
             "\nA packet that is wrong about the world fails identically on every "
-            "attempt, so the queue is the wrong place to find that out. "
-            "`--allow-unassessed` skips this check.",
+            "attempt, so the queue is the wrong place to find that out. Mechanical "
+            "findings are always checked; a model assessment is required of "
+            "`advanced`-tier and human-gated packets, and `--assess-all` extends "
+            "it to the rest. `--allow-unassessed` skips both.",
             file=sys.stderr,
         )
     return 2 if refused else (1 if unreachable else 0)
@@ -884,7 +1052,11 @@ def cmd_approve(fac: Factory, args) -> int:
     if pkt is None:
         print(f"packet for {task.id} is gone", file=sys.stderr)
         return 2
-    cfg = Config(target_branch=args.branch, keep_worktrees=args.keep_worktrees)
+    cfg = Config(
+        target_branch=args.branch,
+        keep_worktrees=args.keep_worktrees,
+        commit_scope=args.commit_scope,
+    )
     outcome = _merge(
         fac, task, pkt, f"task/{task.id}", STATE / "worktrees" / task.id, cfg
     )
@@ -941,7 +1113,7 @@ def cmd_resume(fac: Factory, args) -> int:
         )
         return 2
 
-    repo_dirty = gitops.is_dirty(REPO)
+    repo_dirty = operator_dirty(REPO)
     if repo_dirty and not args.allow_dirty:
         print(
             "the repository has uncommitted changes; the factory merges into "
@@ -964,6 +1136,7 @@ def cmd_resume(fac: Factory, args) -> int:
         skip_permissions=args.dangerously_skip_permissions,
         keep_worktrees=args.keep_worktrees,
         billing=args.billing,
+        commit_scope=args.commit_scope,
     )
     branch = f"task/{task_id}"
     attempt_no = fac.attempt_count(task_id) + 1
@@ -1152,6 +1325,73 @@ def assessment_path(task_id: str) -> Path:
     return ASSESSMENTS_DIR / f"{task_id}.json"
 
 
+def needs_model_assessment(pkt: Packet) -> bool:
+    """Whether this packet must be read by an assessor before it may be queued.
+
+    Assessment is the most expensive phase in this harness by a wide margin, and
+    the margin is structural rather than a tuning problem. An assessment call
+    costs several times an implementation attempt and an order of magnitude more
+    than a review, because a review reads a packet and one diff where an assessor
+    re-reads the packet against every spec section and repo file it cites.
+    Assessment cost is context-volume-bound.
+
+    Against that, `max_attempts` (3 by default) already detects the failure mode
+    assessment exists to prevent: **a packet wrong about the world fails
+    identically on every attempt.** Exhausting the retry budget costs less than
+    an assessment and says the same thing. Implementation is also usually right
+    first time, so the retry budget is rarely spent at all.
+
+    So the trigger moves downstream for most packets, and assessment is kept
+    where being wrong is expensive to unwind rather than merely annoying:
+
+    * **`advanced` tier** — assigned from coupling, so a wrong premise here is
+      one that fails across modules and is expensive to bisect out.
+    * **`gate = "human"`** — the operator is about to spend their own attention.
+      Handing them a packet nothing vetted wastes the scarcest thing in the loop,
+      and the human gate has already caught a false docstring claim that an
+      assessment passed.
+
+    What this accepts is real and worth stating. Implementation failure catches a
+    packet that is *wrong*; it does not catch one that is *vacuous*. A packet can
+    carry a Definition-of-done line turning on a docstring "no longer" saying
+    something the file never said — satisfiable by touching nothing, failable by
+    no diff.
+    `contracts` blocks a merge on an unverifiable **critical** invariant, which
+    covers the invariant half of that class, and `packetlint` catches restated
+    counts and citations past end-of-file. Neither catches an unfalsifiable
+    *prose* criterion. That residue lands on the human gate.
+    """
+    return pkt.tier == "advanced" or pkt.gate == "human"
+
+
+def standing_verdict(pkt: Packet) -> tuple[str, str] | None:
+    """The effective verdict of an assessment of *this exact packet*, or `None`.
+
+    `None` means there is nothing to honour: never assessed, assessed at a
+    different revision, or malformed. It does **not** mean approval.
+
+    This exists so that skipping the *requirement* for an assessment never
+    becomes ignoring one that was already paid for. When the tier policy stopped
+    requiring assessments of `standard` packets, two packets carrying recorded
+    `recut` verdicts — one of them failing `deps-complete`, which means it names
+    artifacts that do not exist — became queueable purely because nobody asked.
+    Evidence already bought is free to read, and a recorded `recut` is the
+    cheapest finding in the system.
+    """
+    path = assessment_path(pkt.id)
+    if not path.is_file():
+        return None
+    try:
+        obj = contracts.read_json(path)
+        if str(obj.get("packet_sha256") or "") != pkt.sha256:
+            return None
+        assessed = contracts.validate_assess(obj, pkt)
+    except contracts.ContractError:
+        return None
+    effective, override = contracts.effective_assessment(assessed)
+    return effective, override or "as the assessor ruled"
+
+
 def load_assessment(pkt: Packet) -> tuple[contracts.AssessResult | None, str]:
     """The gate `sync` applies. Returns `(assessment, why_it_does_not_count)`.
 
@@ -1204,6 +1444,23 @@ def cmd_assess(fac: Factory, args) -> int:
             )
             return 0
 
+    # Before the worktree and before the model. An assessor was asked to notice
+    # this and caught two packets of four; the two it missed had their whole
+    # CREATE list already in the tree, one of them created by a commit whose
+    # subject named the same specification section as the packet's goal.
+    landed = already_landed(pkt, REPO)
+    if landed:
+        print(
+            f"{pkt.id}: the work is already on the branch. These are listed under "
+            f"*Files you may CREATE* and exist:\n"
+            + "".join(f"  {p}\n" for p in landed)
+            + "A packet cannot create a file that exists. Re-cut it against the "
+            "current tree, or retire it — assessing it buys a verdict about work "
+            "nobody is going to do.",
+            file=sys.stderr,
+        )
+        return 2
+
     cut_report = (
         Path(args.cut_report) if args.cut_report else TASKS_DIR / "CUT-REPORT.md"
     )
@@ -1218,9 +1475,14 @@ def cmd_assess(fac: Factory, args) -> int:
         # The packet and its fixtures may not be committed yet — a fresh cut is
         # untracked by design, and assessing only what is already in git would
         # mean assessing nothing at the moment it matters.
+        # Remembered, because the meddling check below cannot otherwise tell a
+        # file this harness copied in from one the assessor wrote.
+        planted_rels = {pkt.path.relative_to(REPO).as_posix()}
         _plant(pkt.path, worktree, pkt.path.relative_to(REPO).as_posix())
         for src, rel in supplied_for(pkt.id):
-            _plant(src, worktree, f"tasks/supplied/{pkt.id}/{rel}")
+            planted = f"tasks/supplied/{pkt.id}/{rel}"
+            planted_rels.add(planted)
+            _plant(src, worktree, planted)
 
         prompt = render(
             PROMPTS / "assess.md",
@@ -1258,7 +1520,19 @@ def cmd_assess(fac: Factory, args) -> int:
         # An assessor that edited the tree was doing something other than
         # assessing, and whatever it concluded was concluded about a repository
         # nobody else will ever see.
-        meddled = gitops.is_dirty(worktree)
+        # A planted path is dirty because the plant above made it dirty. That is
+        # invisible while a packet is untracked -- a fresh cut is, by design, so
+        # the copy lands as an untracked file that `--untracked-files=no` skips --
+        # and it appears the moment a packet is tracked and its working copy
+        # differs from the commit at all. Which is the ordinary state after a
+        # correction round, and on Windows also after nothing more than a line
+        # ending: four assessments were paid for and discarded that way, each
+        # reported as the assessor having edited the packet it was judging.
+        meddled = [
+            entry
+            for entry in gitops.is_dirty(worktree)
+            if entry.split(maxsplit=1)[-1].strip().strip('"') not in planted_rels
+        ]
         if meddled:
             fac.event("assessor_meddled", {"paths": meddled}, pkt.id)
             print(
@@ -1290,7 +1564,7 @@ def cmd_assess(fac: Factory, args) -> int:
         record["harness"] = {
             "effective": effective,
             "override_reason": override,
-            "assessor_model": args.model,
+            "assessor_model": assessor_model,
             "assessed_at": db_now(),
         }
         out = assessment_path(pkt.id)
@@ -1689,10 +1963,8 @@ def _conventions_draft(sources: list[str], claims: list) -> str:
     lines = [
         "# Proposed traps, from the conventions check",
         "",
-        "Nothing here is in effect. Move what earns its place into "
-        "`tasks/TRAPS.md`,",
-        "and delete the rest — a trap that restates something obvious costs "
-        "context on",
+        "Nothing here is in effect. Move what earns its place into `tasks/TRAPS.md`,",
+        "and delete the rest — a trap that restates something obvious costs context on",
         "every future cut, forever.",
         "",
         f"Checked: {', '.join(f'`{s}`' for s in sources)}",
@@ -1903,6 +2175,20 @@ def _cut_output(worktree: Path) -> tuple[list[str], list[str]]:
     return sorted(paths), sorted(refused)
 
 
+def run_spend(fac: Factory, spent_before: float) -> float:
+    """What *this invocation* has been billed, in dollars.
+
+    The cap is a budget for one run of the queue, so it is measured against a
+    baseline taken before the first claim rather than against the project's
+    lifetime total. Read the other way the flag is unusable on any project past
+    its first few tasks — the default halts the loop before it claims anything,
+    and the run reports success having merged nothing.
+
+    Only money that was actually charged counts; see `Factory.total_cost`.
+    """
+    return fac.total_cost(billed_only=True) - spent_before
+
+
 def cmd_run(fac: Factory, args) -> int:
     cfg = Config(
         target_branch=args.branch,
@@ -1912,6 +2198,7 @@ def cmd_run(fac: Factory, args) -> int:
         billing=args.billing,
         max_wait_s=args.max_rate_limit_wait,
         max_parsed_wait_s=args.max_parsed_rate_limit_wait,
+        commit_scope=args.commit_scope,
     )
     print(
         f"billing: {cfg.billing}"
@@ -1921,7 +2208,7 @@ def cmd_run(fac: Factory, args) -> int:
             else "  (reported costs are notional; --max-cost is advisory)"
         )
     )
-    dirty = gitops.is_dirty(REPO)
+    dirty = operator_dirty(REPO)
     if dirty and not args.allow_dirty:
         print(
             "the repository has uncommitted changes; the factory merges into "
@@ -1942,14 +2229,25 @@ def cmd_run(fac: Factory, args) -> int:
     packets = packets_by_id()
     consecutive_errors = 0
     completed = 0
+    stalled = False
+    # The cap bounds what *this invocation* spends, not what the project has
+    # ever spent. Measured against the lifetime total it is unusable after the
+    # first few tasks: the default would halt every established queue before it
+    # claimed anything, and an operator who passes `--max-cost 12` meaning "at
+    # most twelve dollars this run" gets a run that merges nothing and exits 0.
+    # That happened here, which is why this reads a baseline first.
+    spent_before = fac.total_cost(billed_only=True)
 
     while True:
         # Only money that was actually charged counts against the cap. Halting
         # a subscription run on notional spend would stop a queue that cost
         # nothing.
-        spent = fac.total_cost(billed_only=True)
+        spent = run_spend(fac, spent_before)
         if spent >= cfg.max_cost_usd:
-            print(f"\ncost cap reached: ${spent:.2f} >= ${cfg.max_cost_usd:.2f}")
+            print(
+                f"\ncost cap reached: ${spent:.2f} this run "
+                f">= ${cfg.max_cost_usd:.2f}"
+            )
             break
 
         task = fac.claim(args.task) if args.task else fac.claim_next()
@@ -1966,8 +2264,13 @@ def cmd_run(fac: Factory, args) -> int:
                 print("\nqueue stalled — unreachable tasks:", file=sys.stderr)
                 for task_id, deps in stuck:
                     print(f"  {task_id} needs {sorted(deps)}", file=sys.stderr)
-                return 1
-            print("\nqueue drained")
+                # Fall through rather than returning: the summary below names
+                # the packets waiting at a human gate, and those are the
+                # actionable ones. A stall on an unrelated blocked task used to
+                # swallow that list entirely, so one task sitting behind a
+                # blocked dependency hid every packet waiting to be reviewed.
+                stalled = True
+            print("\nqueue drained" if not stuck else "")
             break
 
         pkt = packets.get(task.id)
@@ -2014,19 +2317,30 @@ def cmd_run(fac: Factory, args) -> int:
         else:
             consecutive_errors = 0
 
+        if outcome == "merge_blocked":
+            # Not an environment fault and not retried here: the tree is dirty
+            # for every task, so the next one would implement and review work
+            # that cannot land either. `_merge` has already said what to do.
+            print(
+                f"\nthe queue stops here: {task.id} could not merge over your "
+                "uncommitted changes.",
+                file=sys.stderr,
+            )
+            return 1
         if outcome == "blocked":
             print(f"\n{task.id} is blocked; the queue stops here.", file=sys.stderr)
             reason = (fac.get(task.id) or task).blocked_reason
             print(f"  reason: {reason}", file=sys.stderr)
             return 1
         if outcome == "awaiting_human":
-            print(
-                f"\n{task.id} passed review and is held for you.\n"
-                f"  review:  git diff {cfg.target_branch}...task/{task.id}\n"
-                f"  approve: ./factory/run.py approve {task.id}",
-                file=sys.stderr,
-            )
-            return 0
+            # Hold this packet, not the queue. `awaiting_human` is not a claimable
+            # status, so the loop will not pick it up again, and anything that
+            # depends on it stays un-runnable on its own terms. Everything else
+            # continues: holding the queue leaves independent packets idle through
+            # a review they have no dependency on, which is a review turnaround
+            # added to unrelated work for nothing. The summary is printed once
+            # when the queue drains, rather than interrupting the middle of it.
+            print(f"  held at its gate; the rest of the queue continues")
         if outcome == "done":
             completed += 1
         if args.once or args.task:
@@ -2041,7 +2355,32 @@ def cmd_run(fac: Factory, args) -> int:
             else ""
         )
     )
-    return 0
+
+    held = fac.held()
+    if held:
+        print(
+            f"\n{len(held)} packet(s) passed review and are held for you:",
+            file=sys.stderr,
+        )
+        for task in held:
+            print(
+                f"\n  {task.id}  {task.goal[:64]}\n"
+                f"    review:  git diff {cfg.target_branch}...task/{task.id}\n"
+                f"    approve: ./factory/run.py approve {task.id}",
+                file=sys.stderr,
+            )
+        waiting = fac.waiting_on({t.id for t in held})
+        if waiting:
+            print(
+                f"\n  {len(waiting)} more will queue once those are approved: "
+                + ", ".join(sorted(waiting)),
+                file=sys.stderr,
+            )
+    # A stall is still a non-zero exit — something in the queue cannot run and
+    # somebody has to decide what to do about it — but it now reports the held
+    # packets first, because approving those is usually the next useful act and
+    # the stall is often about an unrelated task nobody was waiting on.
+    return 1 if stalled else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2052,9 +2391,16 @@ def build_parser() -> argparse.ArgumentParser:
     sy.add_argument(
         "--allow-unassessed",
         action="store_true",
-        help="queue packets that have no `ready` assessment. The escape hatch, "
-        "not the workflow — an unassessed packet is the one failure the retry "
-        "loop cannot absorb",
+        help="queue packets that have no `ready` assessment, and skip the "
+        "mechanical packet lint too. The escape hatch, not the workflow",
+    )
+    sy.add_argument(
+        "--assess-all",
+        action="store_true",
+        help="require a `ready` assessment from every packet, not only "
+        "`advanced`-tier and human-gated ones. The pre-measurement behaviour: "
+        "safer per packet and roughly 8x the cost of letting `max_attempts` "
+        "find a wrong packet instead",
     )
     sub.add_parser("plan", help="print the resolved order without running anything")
     sub.add_parser("status", help="print the board")
@@ -2197,7 +2543,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="the branch merges land on (default: the branch checked out, "
         "which is the one `run` requires anyway)",
     )
-    run_p.add_argument("--max-cost", type=float, default=25.0)
+    run_p.add_argument(
+        "--commit-scope",
+        default="",
+        help="conventional-commit scope for merge commits, e.g. 'auth' gives "
+        "`feat(auth): …`. Default: none, since a scope is a fact about the "
+        "project this harness is vendored into and a wrong one is worse than "
+        "no scope",
+    )
+    run_p.add_argument(
+        "--max-cost",
+        type=float,
+        default=25.0,
+        help="stop claiming tasks once THIS invocation has been billed this "
+        "much. Not a lifetime project budget — see `status` for that. Checked "
+        "between tasks, so the task in flight when the cap is reached still "
+        "finishes and the run can exceed it by one task",
+    )
     run_p.add_argument(
         "--max-rate-limit-wait",
         type=float,
@@ -2232,6 +2594,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = sub.add_parser("approve", help="merge a task held for human review")
     ap.add_argument("task_id")
     ap.add_argument("--branch", default=None, help="default: the branch checked out")
+    ap.add_argument("--commit-scope", default="", help="see `run --commit-scope`")
     ap.add_argument("--keep-worktrees", action="store_true")
 
     rs = sub.add_parser(
@@ -2241,6 +2604,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rs.add_argument("task_id")
     rs.add_argument("--branch", default=None, help="default: the branch checked out")
+    rs.add_argument("--commit-scope", default="", help="see `run --commit-scope`")
     rs.add_argument("--allow-dirty", action="store_true")
     rs.add_argument("--keep-worktrees", action="store_true")
     rs.add_argument(

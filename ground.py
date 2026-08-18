@@ -282,22 +282,57 @@ def probe_toolchain(repo: Path, surfaces: list[str]) -> tuple[dict, list[Probe]]
             timeout=_PROBE_TIMEOUT_S,
         )
         match = _FORMAT_COUNT.search(proc.stdout + proc.stderr)
-        red = int(match.group(1)) if match else 0
-        measured["format_red_files"] = red
-        probes.append(
-            Probe(
-                name="toolchain:format",
-                command=cmd,
-                ok=True,
-                detail=(
-                    f"{red} file(s) already fail a whole-tree format check, which "
-                    "is why the gate is scoped to the diff"
-                    if red
-                    else "the tree is clean, so a whole-tree format gate would "
-                    "also pass today"
-                ),
+        # Three outcomes, and the middle one is why `returncode` alone cannot
+        # decide. `ruff format --check` exits non-zero *because* files would be
+        # reformatted, so a red tree and a broken command look identical from the
+        # exit code -- and identical from the absence of a count, unless the count
+        # is what distinguishes them. Read that way: a parsed count means the tool
+        # ran, no count with a clean exit means a clean tree, and no count with a
+        # dirty exit means the command did not do what was asked.
+        if match:
+            red = int(match.group(1))
+            measured["format_red_files"] = red
+            probes.append(
+                Probe(
+                    name="toolchain:format",
+                    command=cmd,
+                    ok=True,
+                    detail=(
+                        f"{red} file(s) already fail a whole-tree format check, "
+                        "which is why the gate is scoped to the diff"
+                    ),
+                )
             )
-        )
+        elif proc.returncode == 0:
+            measured["format_red_files"] = 0
+            probes.append(
+                Probe(
+                    name="toolchain:format",
+                    command=cmd,
+                    ok=True,
+                    detail="the tree is clean, so a whole-tree format gate would "
+                    "also pass today",
+                )
+            )
+        else:
+            # No count and a non-zero exit. The tool is missing, misconfigured, or
+            # refused to start -- and recording zero here would report a missing
+            # binary as a clean tree, which is this module's whole subject. No
+            # `format_red_files` is written, so `--check` compares nothing rather
+            # than comparing against a fiction.
+            tail = (proc.stderr or proc.stdout).strip().splitlines()
+            probes.append(
+                Probe(
+                    name="toolchain:format",
+                    command=cmd,
+                    ok=False,
+                    detail=(
+                        f"exited {proc.returncode} and reported no file count, so "
+                        "the formatter did not run: "
+                        + (tail[0] if tail else "no output")
+                    ),
+                )
+            )
     except (subprocess.TimeoutExpired, OSError) as exc:
         probes.append(Probe("toolchain:format", cmd, False, f"could not run: {exc}"))
 

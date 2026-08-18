@@ -83,6 +83,63 @@ pair**: an assessment pinned to a packet's `sha256` records what was ruled on,
 and nothing at all about which `assess.md` ruled on it. An untracked harness
 gives a fresh clone a vetted packet and an unknown vetter.
 
+## Contributing back
+
+Work on the harness happens in the project that uses it, because that is where
+the defect shows up. Getting it back to the harness's own remote is **not**
+`git subtree push`, and it is not `split` followed by `push` either. Both fail,
+and the second fails in a way worth understanding before you try it.
+
+`git subtree split` re-derives the standalone history from scratch every time. It
+is deterministic given the same inputs, but the fork's `main` is not pure split
+output: it carries commits made *in* the standalone repository, plus a merge that
+reconciled the two histories. So a fresh split shares no shas with the fork past
+that merge, and pushing it is rejected as a non-fast-forward. Forcing it would
+discard the fork-only commits.
+
+The procedure of record keeps a local `factory-split` branch as the published
+tip, and replays only the genuinely-new split commits onto it:
+
+```sh
+# 0. The fork's main and the local split branch must agree before you start.
+git fetch factory-fork
+git rev-parse factory-fork/main factory-split
+
+# 1. Split. Prints a sha; touches neither the working tree nor the checkout.
+git subtree split --prefix=factory <branch-carrying-the-work>
+
+# 2. Confirm the split's tip tree is exactly today's factory/, and find the
+#    last commit that was already published.
+git rev-parse <split-sha>^{tree} <branch>:factory     # must be equal
+git log --oneline factory-fork/main..<split-sha>
+
+# 3. Replay the new tail onto factory-split, in a throwaway detached worktree so
+#    the project's own checkout is never disturbed.
+git worktree add --detach ../_factory-split-tmp <split-sha>
+cd ../_factory-split-tmp
+git rebase --onto factory-split <last-published-split-commit>
+git rev-parse HEAD^{tree}                             # must still equal <branch>:factory
+
+# 4. Advance the branch, prove it is a fast-forward, push.
+git branch -f factory-split $(git rev-parse HEAD)
+git merge-base --is-ancestor factory-fork/main factory-split
+git push --dry-run factory-fork factory-split:main
+git push factory-fork factory-split:main
+
+# 5. Clean up.
+git worktree remove ../_factory-split-tmp && git worktree prune
+```
+
+Step 3 is the load-bearing one and the one a reader who skims this will skip.
+The two `^{tree}` comparisons are the check that matters: they prove the replay
+did not change content, which a rebase over a divergent history can silently do.
+
+`factory-split` is a plain local branch with **no upstream configured**, so it
+does not report being behind and nothing warns you when it drifts. Step 0 is
+there because of that, and it is a real hazard rather than a formality — a
+divergence between the two shows up in step 4's dry run at the earliest, and only
+if you run it.
+
 Not a submodule: `git worktree add` does not check submodules out, and this
 harness lives or dies on what a worktree contains.
 
@@ -159,7 +216,7 @@ gate = "auto"                  # 'human' holds the merge for an operator
 surface = "api"                # picks the gate set
 spec_commit = "504abb9..."     # drift check runs before the task starts
 spec_path = "docs/IMPLEMENTATION-S3-reporting-baseline.md"
-needs_db = false               # adds `pytest -m db`
+extra_pytest_marker = ""       # e.g. "db" adds a `pytest -m db` pass
 requires = ["S08a"]
 forbidden_paths = ["api/tests/conftest.py"]
 
@@ -529,7 +586,8 @@ commands if you need the numbers.
 
 `git`, `python3` (3.11+ for `tomllib`), the `claude` CLI on PATH, plus whatever
 your surfaces need — see [What it assumes about your project](#what-it-assumes-about-your-project).
-Docker for `needs_db` packets.
+Whatever a packet's `extra_pytest_marker` selects, where one is set — the field
+names a held-out subset of your suite and provisions nothing itself.
 
 The repository must be clean and on the target branch when `run` starts, since
 that is where merges land — which is why `--branch` defaults to the branch

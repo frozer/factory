@@ -79,6 +79,37 @@ an invariant.
 hedged — out. If the task genuinely cannot be specified without it, that is a
 finding to report, not a gap to paper over.
 
+## The last pass: three things that are wrong more often than anything else
+
+These are not hazards to keep in mind while writing. They are a re-read you do
+on the finished packet, because each one is invisible from inside the sentence
+that contains it and obvious from outside. Between them they cause more recut
+verdicts than every other cause combined.
+
+**1. A number you stated twice.** Grep your own packet for each count you wrote
+and check that every statement of it agrees. The failure is never the count you
+measured — it is the count you restated in a heading, an invariant `id`, a
+summary line or a *Definition of done* bullet after the measured one was
+already right. An invariant whose `id` says six and whose `assert` enumerates
+seven is a recut, and the assert is usually the correct half. **State a count
+once and refer back to it.** If it must appear twice, the second occurrence
+cites the first rather than repeating the number.
+
+**2. A line range you did not re-open.** For every `path:line` and `path:a-b`,
+open it again and read the first and last line of the range. An off-by-one at
+the start of a range, or a range that stops one line before the attribute it
+was cited to prove, sends a reviewer to count in the wrong place — and they
+find your count wrong when it is right. Where a range is cited to prove a list
+has *n* members, confirm the range contains all *n*.
+
+**3. A label attached to the wrong one of a pair.** Two resources, two classes,
+two constants, two line ranges — name each one, then check the pairing against
+the file rather than against your sentence. `A (protected) and B (managed)`
+with the two swapped reads perfectly and is false. The same applies to a quoted
+string: before writing *"the docstring says X"*, grep the file for X. A string
+you paraphrased from memory and then attributed as a quote will send the
+implementer looking for text that is not there.
+
 # Satisfiability: the check nobody ran
 
 For every invariant you write, name the file whose contents would decide it.
@@ -205,6 +236,15 @@ packet field and a packet using it is rejected); `gate` is `auto|human`;
 It is what stops a stale packet from running after the spec moves. Do not copy
 it from an older packet without checking.
 
+`spec_path` holds one path because the drift check watches one file, **not
+because a packet reads one document.** Prefer a `features/` manifest: it lists a
+document and section per row, so the check fires when a section the packet
+actually reads changes and stays quiet when an unrelated one in the same document
+does. Pinning a document that a manifest already covers is rejected by
+`packet.py`, and for a reason: a packet that pins one document while depending on
+sections spread across several gets a clean drift check for as long as the single
+file it watches happens to be the one that has not moved.
+
 Put in `forbidden_paths` every file an adjacent packet owns that this one might
 plausibly reach for.
 
@@ -237,8 +277,11 @@ implementing the next three packets inside this one.
 
 {{SCOPE}}
 
-Spec: `{{SPEC_PATH}}` at `{{SPEC_COMMIT}}`. Write packets to `{{OUT_DIR}}`, with
-any planted fixtures under `tasks/supplied/<ID>/` mirroring the repo layout.
+Spec: `{{SPEC_PATH}}` at `{{SPEC_COMMIT}}`. If that path is a `features/`
+manifest, the documents and sections to read are the rows of its `## Depends on`
+table — the manifest itself is an index of hashes and specifies nothing. Write
+packets to `{{OUT_DIR}}`, with any planted fixtures under `tasks/supplied/<ID>/`
+mirroring the repo layout.
 
 Order the ids so that nothing depends on a later one, and set `requires`
 accordingly. `run.py plan` prints tasks that can never run — a missing or cyclic

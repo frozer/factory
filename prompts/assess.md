@@ -43,6 +43,14 @@ the point of a re-cut.)
 **{{PACKET_ID}}** — `{{PACKET_PATH}}`
 Spec of record: `{{SPEC_PATH}}` · packet sha256 `{{PACKET_SHA256}}`
 
+**If the spec of record is a `features/` manifest, it is not the specification —
+it is a list of where the specification is.** Open it and read the rows of its
+`## Depends on` table: each names a document and a section, and *those* are the
+text this packet must agree with. Assessing the manifest itself would be
+assessing a table of hashes. A packet's real spec surface is almost never one
+document, which is why the manifest exists; the field holds one path because it
+watches one file for drift, not because the packet reads one file.
+
 {{CUT_REPORT}}
 
 # What you are hunting for
@@ -157,7 +165,12 @@ Also confirm the packet parses: frontmatter rules are enforced by
 `tier` is `basic|standard|advanced` and `model` is not a field at all;
 reviewer never weaker than `tier`; no path in both `forbidden_paths` and
 `deletable_paths`). Confirm `spec_commit` is the current sha of `{{SPEC_PATH}}`,
-not one copied from an older packet.
+not one copied from an older packet — `git log -1 --format=%h -- {{SPEC_PATH}}`.
+When the spec of record is a `features/` manifest that is the sha of the
+manifest, not of any document it lists, and it moves whenever the manifest is
+regenerated. A manifest that is stale against its own documents is a
+separate failure and CI catches it; what you are checking here is only that this
+packet was cut against the manifest as it stands.
 
 # Write your verdict
 
