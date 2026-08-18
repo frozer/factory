@@ -22,6 +22,7 @@ import json
 import re
 import shutil
 import subprocess
+import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,30 @@ PYTEST_NO_TESTS = 5
 _COLLECTION_ERROR = re.compile(
     r"error[s]? during collection|ERROR\s+\S+::|ImportError|ModuleNotFoundError"
 )
+
+
+def declared_markers(api_dir: Path) -> set[str] | None:
+    """Marker names the project registers, or `None` where that cannot be read.
+
+    Only `[tool.pytest.ini_options] markers` in `pyproject.toml` is consulted.
+    A project that registers markers in `pytest.ini` or `setup.cfg` reads as
+    `None` here, which is the same answer as "no configuration at all" on
+    purpose: both mean *this cannot be checked*, and the caller treats an
+    unanswerable question differently from a negative answer.
+    """
+    config = api_dir / "pyproject.toml"
+    if not config.is_file():
+        return None
+    try:
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    ini = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
+    markers = ini.get("markers")
+    if markers is None:
+        return None
+    # Registered as `"name: description"`; the name is what `-m` selects on.
+    return {str(entry).split(":", 1)[0].strip() for entry in markers}
 
 
 def _pytest_verdict(returncode: int, output: str) -> str:
@@ -87,6 +112,20 @@ class GateResult:
     @property
     def failures(self) -> list[Check]:
         return [c for c in self.checks if c.status in ("fail", "error")]
+
+    @property
+    def autoformatted(self) -> list[str]:
+        """Files a check rewrote in place, for the caller to commit.
+
+        The gate runs after the attempt is committed, so a rewrite leaves the
+        worktree dirty. Whoever called `run_checks` has to fold that into the
+        attempt's HEAD — an uncommitted change would be read as meddling by the
+        review path and would not reach the merge at all.
+        """
+        out: list[str] = []
+        for c in self.checks:
+            out.extend(c.detail.get("autoformatted", ()))
+        return out
 
     def summary(self) -> str:
         return " · ".join(f"{c.name}:{c.status}" for c in self.checks)
@@ -188,8 +227,32 @@ def _ruff_check(api_dir: Path, uv: str) -> Check:
     )
 
 
-def _ruff_format(api_dir: Path, uv: str, changed: list[str]) -> Check:
-    """Scoped to the diff — see the module docstring for why."""
+def _ruff_format(
+    api_dir: Path, uv: str, changed: list[str], tampered: list[str]
+) -> Check:
+    """Scoped to the diff — see the module docstring for why.
+
+    **A formatting difference is repaired, not punished.** `ruff format` is
+    deterministic and total: there is exactly one formatting of a given AST, the
+    tool computes it, and no judgement is involved. So a red gate here told an
+    agent to reproduce by hand an output the harness could have written itself,
+    and that is what it did — a packet can spend most of its attempts on
+    whitespace while `ruff check` and the whole test suite pass on every one.
+
+    On a `--check` failure this runs the formatter in write mode over the same
+    scoped targets and re-checks. Passing after that is a `pass`, with the
+    rewritten files named in `detail["autoformatted"]` so it is never silent:
+    the caller commits them and advances `head_sha`, because the work was
+    already committed before the gate ran and an uncommitted rewrite would read
+    as reviewer meddling.
+
+    Two things it will not do. It never writes to a path the packet forbade —
+    `tampered` is excluded from the write set, so a forbidden file that is also
+    misformatted stays misformatted and `untouched` keeps failing the gate on
+    its own terms. And a file that is *still* unformatted after a write-mode run
+    is a real fault, reported as `fail`: ruff declining to reach a fixed point
+    means a syntax error it could not parse, which is the agent's to fix.
+    """
     targets = [
         c[len("api/") :] for c in changed if c.startswith("api/") and c.endswith(".py")
     ]
@@ -198,12 +261,58 @@ def _ruff_format(api_dir: Path, uv: str, changed: list[str]) -> Check:
             name="ruff-format", status="skipped", detail={"reason": "no python in diff"}
         )
     proc = _run([uv, "run", "ruff", "format", "--check", *targets], api_dir)
+    if proc.returncode == 0:
+        return Check(
+            name="ruff-format",
+            status="pass",
+            exit_code=0,
+            detail={"scope": targets},
+            output_tail=_tail(proc),
+        )
+
+    # Forbidden paths are excluded from the write set. `tampered` is repo-relative
+    # like `changed`, so it is trimmed the same way before comparing.
+    off_limits = {
+        t[len("api/") :] for t in tampered if t.startswith("api/") and t.endswith(".py")
+    }
+    writable = [t for t in targets if t not in off_limits]
+    if not writable:
+        return Check(
+            name="ruff-format",
+            status="fail",
+            exit_code=proc.returncode,
+            detail={"scope": targets, "not_written": sorted(off_limits)},
+            output_tail=(
+                "Every misformatted file in the diff is one the packet forbids "
+                "editing, so none was rewritten; see the `untouched` check.\n\n"
+                + _tail(proc)
+            ),
+        )
+
+    write = _run([uv, "run", "ruff", "format", *writable], api_dir)
+    recheck = _run([uv, "run", "ruff", "format", "--check", *targets], api_dir)
+    if recheck.returncode != 0:
+        return Check(
+            name="ruff-format",
+            status="fail",
+            exit_code=recheck.returncode,
+            detail={"scope": targets, "write_attempted": writable},
+            output_tail=(
+                "`ruff format` was run in write mode and the files are still not "
+                "formatted, which means ruff could not parse one of them.\n\n"
+                + _tail(recheck)
+            ),
+        )
     return Check(
         name="ruff-format",
-        status="pass" if proc.returncode == 0 else "fail",
-        exit_code=proc.returncode,
-        detail={"scope": targets},
-        output_tail=_tail(proc),
+        status="pass",
+        exit_code=0,
+        detail={"scope": targets, "autoformatted": writable},
+        output_tail=(
+            "Was unformatted; the harness ran `ruff format` in write mode over "
+            f"{len(writable)} file(s) and re-checked clean. Attempt not spent.\n\n"
+            + _tail(write)
+        ),
     )
 
 
@@ -219,6 +328,44 @@ def _pytest(
     name = f"pytest[{marker}]" if marker else "pytest"
 
     verdict = _pytest_verdict(proc.returncode, blob)
+
+    # A *marked* run that collects nothing is two different states wearing one
+    # exit code, and only one of them is the task's fault.
+    #
+    # `PYTEST_NO_TESTS` on the unmarked run means the suite vanished, which is
+    # what `_pytest_verdict` calls a failure and rightly. On `-m <marker>` it
+    # can instead mean the project registers no such marker — in which case
+    # nothing was ever going to be selected, by this task or any other, and
+    # failing the gate blames the work for a question the project cannot ask.
+    # It fails identically on every attempt, which is the shape the harness
+    # exists to *detect* rather than to produce.
+    #
+    # So: marker registered and empty is a failure (the task owed tests it did
+    # not write). Marker not registered is `skipped`, loudly — the check is
+    # reported, the gate stays green, and the detail names what would make it
+    # mean something.
+    if marker and proc.returncode == PYTEST_NO_TESTS:
+        declared = declared_markers(api_dir)
+        if declared is not None and marker not in declared:
+            return Check(
+                name=name,
+                status="skipped",
+                exit_code=proc.returncode,
+                detail={
+                    **counts,
+                    "marker": marker,
+                    "declared_markers": sorted(declared),
+                },
+                output_tail=(
+                    f"`-m {marker}` selected no tests, and this project registers "
+                    f"no `{marker}` marker: pyproject.toml's "
+                    f"[tool.pytest.ini_options] markers are "
+                    f"{sorted(declared) or 'empty'}. Nothing was verified by this "
+                    f"check. Either register the marker and mark the tests, or "
+                    f"stop setting the flag that asks for it."
+                ),
+            )
+
     if verdict != "pass":
         return Check(
             name=name,
@@ -281,7 +428,7 @@ def run_checks(
     surface: str,
     changed: list[str],
     tampered: list[str],
-    needs_db: bool,
+    extra_marker: str,
     baseline: int | None,
 ) -> GateResult:
     """Every gate for this task, in cheapest-first order.
@@ -303,11 +450,14 @@ def run_checks(
                 )
             )
             return GateResult(status="error", checks=checks, baseline_passed=baseline)
+        # Format before check, and both before pytest. `_ruff_format` may rewrite
+        # files, so anything that reads them has to run after it or it judges
+        # content the merge will not contain.
+        checks.append(_ruff_format(api_dir, uv, changed, tampered))
         checks.append(_ruff_check(api_dir, uv))
-        checks.append(_ruff_format(api_dir, uv, changed))
         checks.append(_pytest(api_dir, uv, marker=None, baseline=baseline))
-        if needs_db:
-            checks.append(_pytest(api_dir, uv, marker="db", baseline=None))
+        if extra_marker:
+            checks.append(_pytest(api_dir, uv, marker=extra_marker, baseline=None))
     else:
         npm = _tool("npm")
         webapp = worktree / "webapp"

@@ -46,7 +46,7 @@ class Task:
     model: str
     reviewer: str
     gate: str
-    needs_db: bool
+    extra_pytest_marker: str
     surface: str
     goal: str
     status: str
@@ -67,7 +67,7 @@ class Task:
             model=row["model"],
             reviewer=row["reviewer"],
             gate=row["gate"],
-            needs_db=bool(row["needs_db"]),
+            extra_pytest_marker=row["extra_pytest_marker"],
             surface=row["surface"],
             goal=row["goal"],
             status=row["status"],
@@ -98,6 +98,7 @@ class Factory:
         for table, column, ddl in (
             ("attempts", "billing", "TEXT NOT NULL DEFAULT 'api'"),
             ("reviews", "billing", "TEXT NOT NULL DEFAULT 'api'"),
+            ("tasks", "extra_pytest_marker", "TEXT NOT NULL DEFAULT ''"),
         ):
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
@@ -141,7 +142,7 @@ class Factory:
             "model": meta["model"],
             "reviewer": meta["reviewer"],
             "gate": meta["gate"],
-            "needs_db": int(meta["needs_db"]),
+            "extra_pytest_marker": meta["extra_pytest_marker"],
             "surface": meta["surface"],
             "goal": meta["goal"],
             "max_attempts": meta["max_attempts"],
@@ -278,24 +279,96 @@ class Factory:
         return ordered
 
     def unreachable(self) -> list[tuple[str, set[str]]]:
-        """Tasks that can never run: a missing or cyclic dependency. Reported
-        rather than silently skipped, because a queue that quietly drops work is
-        worse than one that stops."""
-        reachable = {t.id for t in self.runnable_order()}
+        """Tasks that can **never** run: a missing, blocked, or cyclic dependency.
+
+        Never, not merely not-yet. A task waiting behind one held at a human gate
+        will run the moment that gate is approved, and reporting it as stalled
+        turns an ordinary hold into an error — which is what happened while the
+        queue stopped dead on the first `awaiting_human` and this check reported its
+        dependents as stuck.
+
+        Computed as a fixpoint rather than from `runnable_order`, because the
+        distinction needs transitive reachability in both directions: a dependency
+        that is `awaiting_human` can still become `done`, so its dependents are
+        pending; one that is `blocked` or absent cannot, so its dependents are
+        genuinely unreachable. Iterating to a fixpoint also keeps the cycle
+        detection the previous implementation got from `runnable_order` — two
+        tasks depending on each other never enter the set, whatever their status.
+        """
+        rows = self.conn.execute("SELECT * FROM tasks").fetchall()
+        status = {r["id"]: r["status"] for r in rows}
+        deps: dict[str, set[str]] = {r["id"]: set() for r in rows}
+        for d in self.conn.execute("SELECT * FROM task_deps"):
+            if d["task_id"] in deps:
+                deps[d["task_id"]].add(d["depends_on"])
+
+        # A state a task can still leave under its own steam, or with a human's
+        # approval. `blocked` is not one: it needs a `reset` first, which is a
+        # decision rather than a step.
+        PENDING = (
+            "ready",
+            "needs_work",
+            "running",
+            "gating",
+            "reviewing",
+            "merging",
+            "awaiting_human",
+        )
+        eventually = {i for i, s in status.items() if s == "done"}
+        changed = True
+        while changed:
+            changed = False
+            for task_id, required in deps.items():
+                if task_id in eventually or status.get(task_id) not in PENDING:
+                    continue
+                if all(dep in eventually for dep in required):
+                    eventually.add(task_id)
+                    changed = True
+
         out: list[tuple[str, set[str]]] = []
-        for row in self.conn.execute(
-            "SELECT * FROM tasks WHERE status NOT IN ('done','blocked')"
-        ):
-            if row["id"] in reachable:
+        for row in rows:
+            if row["status"] in TERMINAL or row["id"] in eventually:
                 continue
-            deps = {
-                d["depends_on"]
-                for d in self.conn.execute(
-                    "SELECT depends_on FROM task_deps WHERE task_id = ?", (row["id"],)
-                )
-            }
-            out.append((row["id"], deps))
+            out.append((row["id"], deps[row["id"]]))
         return out
+
+    def waiting_on(self, ids: set[str]) -> list[str]:
+        """Ids of pending tasks that depend, directly or transitively, on *ids*.
+
+        For the message a held gate should carry: "approving this releases four
+        others" is the fact that decides whether a review is worth doing now or
+        after lunch, and it is not visible from the packet.
+        """
+        deps: dict[str, set[str]] = {}
+        for row in self.conn.execute(
+            f"SELECT id FROM tasks WHERE status NOT IN {TERMINAL}"
+        ):
+            deps[row["id"]] = set()
+        for d in self.conn.execute("SELECT * FROM task_deps"):
+            if d["task_id"] in deps:
+                deps[d["task_id"]].add(d["depends_on"])
+        blocked = set(ids)
+        changed = True
+        while changed:
+            changed = False
+            for task_id, required in deps.items():
+                if task_id not in blocked and required & blocked:
+                    blocked.add(task_id)
+                    changed = True
+        return sorted(blocked - set(ids))
+
+    def held(self) -> list[Task]:
+        """Tasks stopped at a human gate, in queue order.
+
+        The run loop prints these as a group when it drains, so a queue that held
+        several packets says so once at the end rather than once per packet in the
+        middle of unrelated work.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM tasks WHERE status = 'awaiting_human' "
+            "ORDER BY ordinal, id"
+        ).fetchall()
+        return [Task.from_row(r) for r in rows]
 
     # ---------------------------------------------------------------- status
 
@@ -396,22 +469,35 @@ class Factory:
         self.event("attempt_started", {"attempt": n, "model": model}, task_id)
         return int(cur.lastrowid or 0)
 
-    def revert_attempt(self, task_id: str, attempt_id: int, reason: str) -> None:
-        """Undo `start_attempt`'s budget bump for a leg that never got a real
-        try at the task — a rate limit the CLI reported before the model did
-        any work.
+    def revert_attempt(
+        self,
+        task_id: str,
+        attempt_id: int,
+        reason: str,
+        *,
+        agent_status: str = "rate_limited",
+    ) -> None:
+        """Undo `start_attempt`'s budget bump for a leg the task is not at fault
+        for — a rate limit the CLI reported before the model did any work, or a
+        merge the operator's own uncommitted changes refused.
 
         The `attempts` row (and its `run_dir` transcript) is left in place and
         marked finished, so the leg is still visible in history; only the
         `tasks.attempts` cap counter — what `max_attempts` and the board check
-        — is rolled back, so a string of rate limits can't exhaust a task's
-        real retry budget on faults that were never its fault.
+        — is rolled back, so a string of such faults can't exhaust a task's
+        real retry budget on things that were never its fault.
+
+        `agent_status` is a parameter because the two callers mean different
+        things by it. A rate limit means the model never ran. A blocked merge
+        means it ran, the gate passed and the reviewer accepted — overwriting
+        that with `rate_limited` would erase the only record that the work was
+        finished and good.
         """
         self.conn.execute(
             "UPDATE tasks SET attempts = MAX(attempts - 1, 0), updated_at=? WHERE id=?",
             (now(), task_id),
         )
-        self.finish_attempt(attempt_id, agent_status="rate_limited")
+        self.finish_attempt(attempt_id, agent_status=agent_status)
         self.event("attempt_reverted", {"reason": reason}, task_id)
 
     def finish_attempt(self, attempt_id: int, **fields: Any) -> None:

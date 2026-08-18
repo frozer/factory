@@ -53,6 +53,31 @@ REVIEWER_LADDER = {"basic": "standard", "standard": "standard", "advanced": "adv
 
 SURFACES = ("api", "webapp")
 
+# The repo this module ships in, for the one rule that has to look outside the
+# packet. `parse` takes it as an argument so a test can point the rule at a
+# fixture; this is only the default.
+REPO = Path(__file__).resolve().parent.parent
+
+SPECS_PREFIX = "docs/specs/"
+
+FEATURES_DIR = "features"
+
+# One row of a manifest's `## Depends on` table: `| `SPEC_x.md` | §5 | `abc123` |`.
+# Only the document column is read here — which sections a manifest watches is the
+# business of whatever generates the manifest, and this rule just needs to know
+# that some manifest already speaks for the document. The pattern is the document
+# half of that generator's dependency-row pattern, and has to keep agreeing with
+# it: a row one reads as a dependency and the other does not is a packet waved
+# through against a document something is already watching.
+MANIFEST_DEP_ROW = re.compile(r"^\|\s*`?([A-Za-z0-9_.-]+\.md)`?\s*\|")
+
+# `## Files you may CREATE`, and the backticked bullets under it. Backticks are
+# required, which is what keeps `- none. Everything this task needs already
+# exists` out of the list without special-casing the word.
+CREATE_HEADING = re.compile(r"^##\s+Files you may CREATE\s*$", re.IGNORECASE)
+NEXT_HEADING = re.compile(r"^##\s+")
+CREATE_BULLET = re.compile(r"^[-*]\s+`([^`]+)`")
+
 
 class PacketError(ValueError):
     """A packet that cannot be trusted to drive a run."""
@@ -83,7 +108,12 @@ class Packet:
     surface: str
     spec_commit: str
     spec_path: str
-    needs_db: bool
+    #: A pytest marker to run as a *second*, separate pytest invocation, or
+    #: `""` for none. Not "this task uses a database" — that is what the name
+    #: `needs_db` said, and that name is what led packets to set it for a marker
+    #: their project never registered. It selects a held-out subset of the suite;
+    #: where the project holds none out, there is nothing to ask for.
+    extra_pytest_marker: str
     max_attempts: int
     requires: list[str]
     invariants: list[Invariant]
@@ -93,6 +123,7 @@ class Packet:
     ordinal: int = 0
     forbidden_paths: list[str] = field(default_factory=list)
     deletable_paths: list[str] = field(default_factory=list)
+    create_paths: list[str] = field(default_factory=list)
 
     @property
     def critical_invariants(self) -> list[Invariant]:
@@ -114,7 +145,7 @@ class Packet:
             "model": self.tier,
             "reviewer": self.reviewer,
             "gate": self.gate,
-            "needs_db": self.needs_db,
+            "extra_pytest_marker": self.extra_pytest_marker,
             "surface": self.surface,
             "max_attempts": self.max_attempts,
             "requires": self.requires,
@@ -127,18 +158,113 @@ def _require(meta: dict[str, Any], key: str, path: Path) -> Any:
     return meta[key]
 
 
+def _extra_marker(meta: dict) -> str:
+    """`extra_pytest_marker`, accepting the retired `needs_db` spelling.
+
+    `needs_db = true` meant "also run `pytest -m db`", and its name did not say
+    so. A cutter reading the name sets it wherever the task's tests touch a
+    datastore, which is not what it asks for. It asks for a *held-out subset of
+    the suite*, and a project that holds none out has nothing to give it.
+
+    The old key is still honoured rather than rejected, because packets already
+    written carry it and `sync` re-reads the merged ones: refusing it would break
+    the board for work that has long since finished. It is translated, not
+    deprecated in place, so a packet keeps meaning what it meant.
+    """
+    marker = meta.get("extra_pytest_marker")
+    if marker is not None:
+        return str(marker).strip()
+    return "db" if bool(meta.get("needs_db", False)) else ""
+
+
 def _str_list(value: Any, key: str, path: Path) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
         raise PacketError(f"{path.name}: `{key}` must be a list of strings")
     return list(value)
 
 
-def parse(path: Path, *, ordinal: int = 0) -> Packet:
+def _manifest_covering(spec_path: str, repo: Path) -> Path | None:
+    """The `features/` manifest that already lists this document, if there is one.
+
+    Reads defensively and answers `None` for everything it is not sure about: a
+    `features/` that is absent, or a file in it that cannot be read, is not
+    evidence about the packet, and turning either into a parse failure would
+    halt a sync over the state of a directory the packet never mentions.
+    """
+    normalized = spec_path.strip().replace("\\", "/")
+    if not normalized.startswith(SPECS_PREFIX):
+        return None
+    document = normalized.rsplit("/", 1)[-1]
+
+    directory = repo / FEATURES_DIR
+    if not directory.is_dir():
+        return None
+    for manifest in sorted(directory.glob("*.md")):
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            row = MANIFEST_DEP_ROW.match(line)
+            if row is not None and row.group(1) == document:
+                return manifest
+    return None
+
+
+def _create_paths(body: str) -> list[str]:
+    """The paths under `## Files you may CREATE`, in the order the packet lists them.
+
+    Read from the body rather than the frontmatter because that is where a cutter
+    writes them and where an implementer reads them; a second copy in `+++` would
+    be a second thing to keep true.
+    """
+    paths: list[str] = []
+    inside = False
+    for line in body.splitlines():
+        if CREATE_HEADING.match(line):
+            inside = True
+            continue
+        if inside and NEXT_HEADING.match(line):
+            break
+        if inside:
+            bullet = CREATE_BULLET.match(line.strip())
+            if bullet is not None:
+                paths.append(bullet.group(1).strip().replace("\\", "/"))
+    return paths
+
+
+def already_landed(pkt: Packet, repo: Path) -> list[str]:
+    """Paths the packet is to CREATE that are already files in the tree.
+
+    A packet cannot create a file that exists, so any hit here is a packet with
+    no remaining work — or with work it can only do by editing outside its own
+    boundary, which the gates refuse anyway. Cheap, mechanical, and deliberately
+    so: packets sit in the queue as `ready` while the branch that cut them
+    implements them by hand, and a re-assessment asked to notice this catches only
+    some of them. A verdict is a judgement and this is a stat call.
+
+    Says nothing about a packet that only EDITs. Those are the ones this cannot
+    see, and a packet whose whole boundary is an edit list has to be judged.
+    """
+    landed = []
+    for rel in pkt.create_paths:
+        candidate = repo / rel
+        try:
+            if candidate.is_file():
+                landed.append(rel)
+        except OSError:
+            continue
+    return landed
+
+
+def parse(path: Path, *, ordinal: int = 0, repo: Path = REPO) -> Packet:
     """Read and validate one packet. Raises `PacketError` with the file named.
 
     Validation is strict and total: an invalid packet halts the sync rather than
     being skipped, because a queue that silently drops work is worse than one
     that refuses to start.
+
+    `repo` is only where `features/` is looked for — see `_manifest_covering`.
     """
     raw = path.read_text(encoding="utf-8")
     match = FRONTMATTER.match(raw)
@@ -210,6 +336,22 @@ def parse(path: Path, *, ordinal: int = 0) -> Packet:
             "packet from being run after the spec moved underneath it"
         )
 
+    # A packet that pins a raw document a manifest already covers is watching
+    # one file while its work draws on every section that manifest lists — the
+    # drift check then stays silent through a change the packet was wrong
+    # about. The manifest exists precisely so that cannot happen, so the packet
+    # is refused rather than allowed to re-open the hole. A document no
+    # manifest names is left alone: a one-document scope is a real scope.
+    spec_path = str(_require(meta, "spec_path", path))
+    covering = _manifest_covering(spec_path, repo)
+    if covering is not None:
+        raise PacketError(
+            f"{path.name}: `spec_path` {spec_path!r} is covered by "
+            f"{covering.relative_to(repo).as_posix()} — pin that manifest "
+            "instead. Pinning the document watches one file, while the "
+            "manifest watches every section the scope actually draws on"
+        )
+
     forbidden_paths = _str_list(
         meta.get("forbidden_paths", []), "forbidden_paths", path
     )
@@ -233,13 +375,14 @@ def parse(path: Path, *, ordinal: int = 0) -> Packet:
         gate=gate,
         surface=surface,
         spec_commit=spec_commit,
-        spec_path=str(_require(meta, "spec_path", path)),
-        needs_db=bool(meta.get("needs_db", False)),
+        spec_path=spec_path,
+        extra_pytest_marker=_extra_marker(meta),
         max_attempts=int(meta.get("max_attempts", 3)),
         requires=_str_list(meta.get("requires", []), "requires", path),
         invariants=invariants,
         forbidden_paths=forbidden_paths,
         deletable_paths=deletable_paths,
+        create_paths=_create_paths(body),
         body=body,
         path=path,
         sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),

@@ -17,12 +17,13 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import textwrap
 import types
 import unittest
-import unittest.mock
+import unittest.mock as mock
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +36,7 @@ import gates  # noqa: E402
 import gitops  # noqa: E402
 import ground  # noqa: E402
 import packet as packet_module  # noqa: E402
+import packetlint  # noqa: E402
 import run  # noqa: E402
 from db import Factory  # noqa: E402
 from packet import (  # noqa: E402
@@ -157,6 +159,66 @@ class PacketValidation(unittest.TestCase):
         pkt = parse(write(self.dir, "B01-example.md", text))
         self.assertEqual(pkt.deletable_paths, ["api/old_route.py"])
 
+    def _pinning(self, spec_path: str) -> Path:
+        return write(
+            self.dir,
+            "B01-example.md",
+            VALID.replace('spec_path = "docs/SPEC.md"', f'spec_path = "{spec_path}"'),
+        )
+
+    def _manifest(self, name: str, *documents: str) -> Path:
+        rows = "\n".join(f"| `{d}` | §5 | `abc123abc123` |" for d in documents)
+        features = self.dir / "features"
+        features.mkdir(exist_ok=True)
+        return write(
+            features,
+            name,
+            "+++\n"
+            f'name = "{name.removesuffix(".md")}"\n'
+            "+++\n\n"
+            "## Depends on\n\n"
+            "| Document | Section | Content hash |\n"
+            "|---|---|---|\n"
+            f"{rows}\n",
+        )
+
+    def test_a_spec_path_a_manifest_already_covers_is_refused(self) -> None:
+        """The mistake the rule exists for: pinning one document while the work
+        copies from sections spread across several. `spec_moved` then watches the
+        wrong file and says nothing when a section the packet read changes."""
+        self._manifest("widgets.md", "SPEC_widgets.md")
+        with self.assertRaises(PacketError) as exc:
+            parse(
+                self._pinning("docs/specs/SPEC_widgets.md"),
+                repo=self.dir,
+            )
+        # The manifest is named, so the fix is the message.
+        self.assertIn("features/widgets.md", str(exc.exception))
+
+    def test_a_document_no_manifest_covers_is_left_alone(self) -> None:
+        """A scope that genuinely is one document is not the failure here, and
+        a rule that demanded a manifest for every packet would be a different
+        rule than the one that was agreed."""
+        self._manifest("widgets.md", "SPEC_widgets.md")
+        pkt = parse(self._pinning("docs/specs/SPEC_reports.md"), repo=self.dir)
+        self.assertEqual(pkt.spec_path, "docs/specs/SPEC_reports.md")
+
+    def test_no_features_directory_at_all_refuses_nothing(self) -> None:
+        """Zero manifests is the state every repo starts in — reading a
+        directory that is not there must not fail the packet, or the rule
+        becomes a requirement that manifests exist."""
+        pkt = parse(
+            self._pinning("docs/specs/SPEC_widgets.md"), repo=self.dir
+        )
+        self.assertEqual(pkt.spec_path, "docs/specs/SPEC_widgets.md")
+
+    def test_a_spec_path_that_is_itself_a_manifest_is_accepted(self) -> None:
+        """The fix the rule exists to push packets towards cannot be the thing
+        it rejects."""
+        self._manifest("widgets.md", "SPEC_widgets.md")
+        pkt = parse(self._pinning("features/widgets.md"), repo=self.dir)
+        self.assertEqual(pkt.spec_path, "features/widgets.md")
+
     def test_a_path_both_forbidden_and_deletable_is_refused(self) -> None:
         text = VALID.replace(
             'spec_path = "docs/SPEC.md"',
@@ -167,6 +229,130 @@ class PacketValidation(unittest.TestCase):
         with self.assertRaises(PacketError) as exc:
             parse(write(self.dir, "B01-example.md", text))
         self.assertIn("api/old_route.py", str(exc.exception))
+
+
+class MergeCommitMessage(unittest.TestCase):
+    """The scope is the project's, not the harness's.
+
+    A scope baked in here labels every task any project merges with a name from
+    the numbering of whichever repository the harness was written in. The same
+    argument `Config.target_branch` already makes: a baked-in project fact is
+    either redundant or wrong, and it is wrong everywhere except where it was
+    written.
+    """
+
+    def _message(self, scope: str) -> str:
+        cfg = run.Config(target_branch="main", commit_scope=scope)
+        marker = f"({cfg.commit_scope})" if cfg.commit_scope else ""
+        return f"feat{marker}: do the thing [B01]"
+
+    def test_no_scope_by_default(self) -> None:
+        self.assertEqual(run.Config(target_branch="main").commit_scope, "")
+        self.assertEqual(self._message(""), "feat: do the thing [B01]")
+
+    def test_a_scope_is_parenthesised(self) -> None:
+        self.assertEqual(self._message("auth"), "feat(auth): do the thing [B01]")
+
+    def test_every_merging_command_accepts_the_flag(self) -> None:
+        """`approve` and `resume` merge too, so a scope set only on `run` would
+        relabel a task depending on which command finished it."""
+        parser = run.build_parser() if hasattr(run, "build_parser") else None
+        if parser is None:
+            self.skipTest("no build_parser to introspect")
+        for command in ("run", "approve", "resume"):
+            with self.subTest(command=command):
+                args = parser.parse_args(
+                    [command, *(["B01"] if command != "run" else [])]
+                )
+                self.assertTrue(hasattr(args, "commit_scope"))
+
+
+class AlreadyLanded(unittest.TestCase):
+    """A packet whose CREATE list is already in the tree has no work left.
+
+    The case this exists for: packets cut on a branch that then implemented them
+    by hand before any of them ran, where the re-assessment asked to notice caught
+    only some. A model given the same evidence twice read it differently; this is
+    a stat call, so it cannot.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _packet(self, section: str) -> object:
+        return parse(
+            write(self.dir, "B01-example.md", VALID.rstrip() + "\n\n" + section)
+        )
+
+    def _plant(self, rel: str) -> None:
+        target = self.dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("landed\n", encoding="utf-8")
+
+    def test_the_create_list_is_read_from_the_body(self) -> None:
+        pkt = self._packet(
+            "## Files you may CREATE\n\n"
+            "- `api/widgets/items.py`\n"
+            "- `api/tests/test_items.py`\n\n"
+            "## Files you may EDIT\n\n"
+            "- `api/store/keys.py`\n"
+        )
+        self.assertEqual(
+            pkt.create_paths, ["api/widgets/items.py", "api/tests/test_items.py"]
+        )
+
+    def test_the_edit_list_is_not_swept_in(self) -> None:
+        """The heading after CREATE ends it. An EDIT path is expected to exist,
+        so counting one as landed would block every packet that edits anything."""
+        pkt = self._packet(
+            "## Files you may CREATE\n\n"
+            "- `api/new.py`\n\n"
+            "## Files you may EDIT\n\n"
+            "- `api/existing.py`\n"
+        )
+        self._plant("api/existing.py")
+        self.assertEqual(pkt.create_paths, ["api/new.py"])
+        self.assertEqual(packet_module.already_landed(pkt, self.dir), [])
+
+    def test_a_none_bullet_is_not_a_path(self) -> None:
+        """`- none. Everything this task needs already exists` is prose, and the
+        backticks are what tell it apart from a path without matching the word."""
+        pkt = self._packet(
+            "## Files you may CREATE\n\n"
+            "- none. Everything this task needs already exists.\n"
+        )
+        self.assertEqual(pkt.create_paths, [])
+        self.assertEqual(packet_module.already_landed(pkt, self.dir), [])
+
+    def test_a_packet_whose_create_list_is_in_the_tree_is_reported(self) -> None:
+        pkt = self._packet(
+            "## Files you may CREATE\n\n"
+            "- `api/widgets/publish.py`\n"
+            "- `api/tests/test_publish.py`\n"
+        )
+        self._plant("api/widgets/publish.py")
+        self.assertEqual(
+            packet_module.already_landed(pkt, self.dir), ["api/widgets/publish.py"]
+        )
+
+    def test_a_packet_with_nothing_in_the_tree_is_left_alone(self) -> None:
+        pkt = self._packet("## Files you may CREATE\n\n- `api/widgets/publish.py`\n")
+        self.assertEqual(packet_module.already_landed(pkt, self.dir), [])
+
+    def test_a_packet_with_no_create_section_is_not_a_finding(self) -> None:
+        """Silence rather than a guess. A packet whose whole boundary is an edit
+        list is one this check cannot see, and saying nothing is the honest
+        answer — not `[]` standing in for `there is no work left`."""
+        pkt = self._packet("## Files you may EDIT\n\n- `api/store/keys.py`\n")
+        self.assertEqual(pkt.create_paths, [])
+        self.assertEqual(packet_module.already_landed(pkt, self.dir), [])
+
+    def test_a_directory_at_the_path_is_not_a_landed_file(self) -> None:
+        pkt = self._packet("## Files you may CREATE\n\n- `api/widgets`\n")
+        (self.dir / "api" / "widgets").mkdir(parents=True)
+        self.assertEqual(packet_module.already_landed(pkt, self.dir), [])
 
 
 class ImplContract(unittest.TestCase):
@@ -411,6 +597,37 @@ class Gates(unittest.TestCase):
     def test_an_empty_suite_is_a_failure_not_a_pass(self) -> None:
         self.assertEqual(gates._pytest_verdict(5, "no tests ran"), "fail")
 
+    def test_declared_markers_reads_the_names_and_drops_the_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api = Path(tmp)
+            (api / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\n"
+                'markers = ["slow: runs against a real service", "manual: by hand"]\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(gates.declared_markers(api), {"slow", "manual"})
+
+    def test_a_project_that_registers_no_markers_is_unanswerable_not_empty(self) -> None:
+        """`None` and `set()` mean different things and the caller acts on both.
+
+        `set()` is "this project registers markers, and yours is not among
+        them" — a negative answer. `None` is "nothing here can answer that",
+        which is what a missing file, an unreadable one, or markers configured
+        somewhere this does not look all produce. Collapsing the two would let
+        a `pytest.ini` project's every marked run be scored as unregistered.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            api = Path(tmp)
+            self.assertIsNone(gates.declared_markers(api))
+            (api / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+            self.assertIsNone(gates.declared_markers(api))
+            (api / "pyproject.toml").write_text("nonsense = [", encoding="utf-8")
+            self.assertIsNone(gates.declared_markers(api))
+            (api / "pyproject.toml").write_text(
+                '[tool.pytest.ini_options]\nmarkers = []\n', encoding="utf-8"
+            )
+            self.assertEqual(gates.declared_markers(api), set())
+
     def test_editing_a_forbidden_path_fails_the_gate(self) -> None:
         check = gates.check_untouched(["api/tests/test_vintage.py"])
         self.assertEqual(check.status, "fail")
@@ -418,6 +635,299 @@ class Gates(unittest.TestCase):
 
     def test_touching_nothing_forbidden_passes(self) -> None:
         self.assertEqual(gates.check_untouched([]).status, "pass")
+
+
+class RuffFormatRepairs(unittest.TestCase):
+    """`ruff format` is deterministic and total, so a difference is repaired.
+
+    Left as a failure, it makes a packet spend attempts reproducing by hand an
+    output the harness could have written itself, with `ruff check` and the entire
+    test suite green on every one. These tests pin the repair and, just as
+    importantly, the three cases where it must NOT happen.
+    """
+
+    def _fake_run(self, codes: list[int]) -> tuple:
+        """Return a `_run` stand-in yielding `codes` in order, recording calls."""
+        calls: list[list[str]] = []
+        seq = list(codes)
+
+        def run(cmd: list[str], cwd) -> subprocess.CompletedProcess:
+            calls.append(cmd)
+            code = seq.pop(0) if seq else 0
+            return subprocess.CompletedProcess(cmd, code, "out", "")
+
+        return run, calls
+
+    def test_a_formatted_diff_passes_without_writing(self) -> None:
+        run, calls = self._fake_run([0])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(Path("api"), "uv", ["api/a.py"], [])
+        self.assertEqual(check.status, "pass")
+        self.assertNotIn("autoformatted", check.detail)
+        self.assertEqual(len(calls), 1, "must not run the formatter when clean")
+        self.assertIn("--check", calls[0])
+
+    def test_an_unformatted_diff_is_rewritten_and_passes(self) -> None:
+        # --check fails, write succeeds, re-check clean.
+        run, calls = self._fake_run([1, 0, 0])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(
+                Path("api"), "uv", ["api/a.py", "api/b.py"], []
+            )
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.detail["autoformatted"], ["a.py", "b.py"])
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--check", calls[1], "second call is write mode")
+        self.assertIn("--check", calls[2], "third call re-verifies")
+
+    def test_a_file_ruff_cannot_parse_still_fails(self) -> None:
+        """Write mode that does not reach a fixed point is a real fault."""
+        run, _ = self._fake_run([1, 1, 1])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(Path("api"), "uv", ["api/a.py"], [])
+        self.assertEqual(check.status, "fail")
+        self.assertNotIn("autoformatted", check.detail)
+        self.assertIn("could not parse", check.output_tail)
+
+    def test_a_forbidden_path_is_never_rewritten(self) -> None:
+        """The one thing worse than a red gate: the gate committing a violation."""
+        run, calls = self._fake_run([1])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(
+                Path("api"), "uv", ["api/frozen.py"], ["api/frozen.py"]
+            )
+        self.assertEqual(check.status, "fail")
+        self.assertEqual(check.detail["not_written"], ["frozen.py"])
+        self.assertEqual(len(calls), 1, "no write may be attempted")
+
+    def test_a_forbidden_path_does_not_block_repairing_the_others(self) -> None:
+        run, calls = self._fake_run([1, 0, 0])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(
+                Path("api"), "uv", ["api/mine.py", "api/frozen.py"], ["api/frozen.py"]
+            )
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.detail["autoformatted"], ["mine.py"])
+        self.assertNotIn("frozen.py", calls[1])
+
+    def test_a_diff_with_no_python_is_skipped(self) -> None:
+        run, calls = self._fake_run([])
+        with mock.patch.object(gates, "_run", run):
+            check = gates._ruff_format(Path("api"), "uv", ["docs/x.md"], [])
+        self.assertEqual(check.status, "skipped")
+        self.assertEqual(calls, [])
+
+    def test_the_result_collects_rewritten_files_for_the_caller(self) -> None:
+        """`run.py` commits these; an uncommitted rewrite reads as meddling."""
+        result = gates.GateResult(
+            status="green",
+            checks=[
+                gates.Check(name="untouched", status="pass"),
+                gates.Check(
+                    name="ruff-format",
+                    status="pass",
+                    detail={"autoformatted": ["a.py", "b.py"]},
+                ),
+            ],
+        )
+        self.assertEqual(result.autoformatted, ["a.py", "b.py"])
+
+    def test_a_clean_result_reports_nothing_to_commit(self) -> None:
+        result = gates.GateResult(
+            status="green", checks=[gates.Check(name="ruff-format", status="pass")]
+        )
+        self.assertEqual(result.autoformatted, [])
+
+
+class OperatorDirty(unittest.TestCase):
+    """One definition of "the operator's uncommitted work", used by three guards.
+
+    `cmd_run` and `cmd_resume` refuse to start over a dirty tree and `_merge`
+    refuses to merge over one. All three were reading `is_dirty` raw, and the
+    board is dirty as a matter of course — the harness writes it. That stopped
+    `approve` and then `resume`, each over a file the command before it had
+    written.
+    """
+
+    def test_the_board_alone_is_not_the_operator_s_work(self) -> None:
+        with mock.patch.object(run.gitops, "is_dirty", return_value=[" M tasks/README.md"]):
+            self.assertEqual(run.operator_dirty(Path(".")), [])
+
+    def test_real_work_is(self) -> None:
+        with mock.patch.object(
+            run.gitops, "is_dirty", return_value=[" M tasks/B02.md", " M api/main.py"]
+        ):
+            self.assertEqual(len(run.operator_dirty(Path("."))), 2)
+
+    def test_the_board_is_filtered_out_from_among_real_work(self) -> None:
+        with mock.patch.object(
+            run.gitops,
+            "is_dirty",
+            return_value=[" M tasks/README.md", " M api/main.py"],
+        ):
+            self.assertEqual(run.operator_dirty(Path(".")), [" M api/main.py"])
+
+    def test_a_file_merely_ending_in_readme_is_not_the_board(self) -> None:
+        """`docs/README.md` is somebody's work; only `tasks/README.md` is ours."""
+        with mock.patch.object(run.gitops, "is_dirty", return_value=[" M docs/README.md"]):
+            self.assertEqual(run.operator_dirty(Path(".")), [" M docs/README.md"])
+
+
+class MergeOverADirtyTree(unittest.TestCase):
+    """`_merge` refuses before it tries, and says what to do.
+
+    The old behaviour discovered this from `git merge --squash`'s own error,
+    after the implementation, the gate and the review had all been paid for.
+    """
+
+    def _merge(self, dirty: list[str]) -> tuple[str, dict]:
+        calls: dict = {}
+        fac = mock.MagicMock()
+        task = types.SimpleNamespace(id="M01")
+        pkt = types.SimpleNamespace(goal="a goal")
+        cfg = types.SimpleNamespace(
+            target_branch="integration", commit_scope="auth", keep_worktrees=True
+        )
+        with (
+            mock.patch.object(run.gitops, "is_dirty", return_value=dirty),
+            mock.patch.object(
+                run.gitops, "squash_merge", side_effect=lambda *a: calls.setdefault("merged", "sha")
+            ),
+            # Only reached on the clean path; neither is what these tests are about.
+            mock.patch.object(run.board, "write"),
+            mock.patch.object(run.gitops, "amend_with", return_value="sha"),
+            mock.patch.object(run.gitops, "worktree_remove"),
+            mock.patch.object(run.gitops, "branch_delete"),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            outcome = run._merge(fac, task, pkt, "task/M01", Path("wt"), cfg, 7)
+        calls["stderr"] = err.getvalue()
+        calls["fac"] = fac
+        return outcome, calls
+
+    def test_a_dirty_tree_stops_before_the_merge_is_attempted(self) -> None:
+        outcome, calls = self._merge([" M tasks/B02.md", " M tasks/assessments/B02.json"])
+        self.assertEqual(outcome, "merge_blocked")
+        self.assertNotIn("merged", calls, "squash_merge must not be called")
+
+    def test_the_attempt_is_returned_to_the_budget(self) -> None:
+        _, calls = self._merge([" M a.md"])
+        calls["fac"].revert_attempt.assert_called_once()
+        self.assertEqual(
+            calls["fac"].revert_attempt.call_args.kwargs["agent_status"], "merge_blocked"
+        )
+
+    def test_it_names_the_files_and_the_command_that_recovers(self) -> None:
+        """An operator who is told only "merge failed" re-runs the task and pays
+        for the implementation twice."""
+        _, calls = self._merge([" M tasks/B02.md"])
+        self.assertIn("tasks/B02.md", calls["stderr"])
+        self.assertIn("resume M01", calls["stderr"])
+        self.assertIn("not counted against its budget", calls["stderr"])
+
+    def test_the_board_alone_does_not_block_the_merge(self) -> None:
+        """The harness writes `tasks/README.md` itself and amends it into this
+        very commit. Counting it as operator work deadlocked `approve`: resume
+        regenerates the board, approve refuses over it, and committing it by hand
+        lasts only until the next regeneration."""
+        outcome, calls = self._merge([" M tasks/README.md"])
+        self.assertTrue(calls.get("merged"))
+        self.assertEqual(outcome, "done")
+        calls["fac"].revert_attempt.assert_not_called()
+
+    def test_the_board_beside_real_work_still_blocks(self) -> None:
+        outcome, calls = self._merge([" M tasks/README.md", " M tasks/B02.md"])
+        self.assertEqual(outcome, "merge_blocked")
+        self.assertIn("tasks/B02.md", calls["stderr"])
+
+    def test_a_clean_tree_merges(self) -> None:
+        outcome, calls = self._merge([])
+        self.assertTrue(calls.get("merged"))
+        calls["fac"].revert_attempt.assert_not_called()
+        self.assertEqual(outcome, "done")
+
+
+class InheritedImports(unittest.TestCase):
+    """"`X` is already imported by `B04`" when `B04` names no such symbol.
+
+    Two shapes it was written for: a packet making `StoredValue` its own module's
+    type on the grounds a predecessor had imported it, and a packet making
+    `Widget` its `response_model` on the grounds two predecessors had. Both are
+    impossible, not merely unchecked — an unused import is F401 and every packet
+    in this family runs `ruff check`.
+
+    Most of these tests assert silence. Three real inheritances (`widget_read` and
+    `PublishConflict` on continuation lines inside a parenthesised import,
+    `Annotated` added by a later prose-described step) all tripped stricter
+    versions of this rule, and three false alarms is how a lint gets switched off.
+    """
+
+    def _lint(self, body: str, predecessors: dict[str, str]) -> list:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tasks").mkdir()
+            for pid, text in predecessors.items():
+                (root / "tasks" / f"{pid}-thing.md").write_text(text, encoding="utf-8")
+            pkt = types.SimpleNamespace(body=body, create_paths=[], invariants=[])
+            return packetlint.check_inherited_imports(pkt, root)
+
+    def test_a_symbol_the_predecessor_never_mentions_is_a_finding(self) -> None:
+        found = self._lint(
+            "`StoredValue` is already imported in this module by B01's contract.",
+            {"B01": "B01 imports the module objects and ValueRef."},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("StoredValue", found[0].detail)
+        self.assertEqual(found[0].check, "inherited-import-absent")
+
+    def test_a_bare_packet_id_is_recognised(self) -> None:
+        """A packet can write `by B01's contract` with no backticks; requiring
+        them is what made an earlier draft miss the defect it existed for."""
+        self.assertEqual(
+            len(self._lint("`Widget` is already imported by B01's contract.", {"B01": "nothing"})),
+            1,
+        )
+
+    def test_a_symbol_on_a_continuation_line_is_not_a_finding(self) -> None:
+        """`PublishConflict` arrives inside `from x import (` … `)`."""
+        self.assertEqual(
+            self._lint(
+                "`PublishConflict` is already imported by `B04`.",
+                {"B04": "from api.widgets.publish import (\n    PublishConflict,\n)"},
+            ),
+            [],
+        )
+
+    def test_a_symbol_a_later_step_adds_in_prose_is_not_a_finding(self) -> None:
+        """`Annotated` is not in B03's dictated block; its prose adds it."""
+        self.assertEqual(
+            self._lint(
+                "`Annotated` is already imported by `B03`.",
+                {"B03": "`Annotated` is used in read_widget's signature; make it `Annotated, Any`."},
+            ),
+            [],
+        )
+
+    def test_imported_or_declared_is_skipped(self) -> None:
+        """That phrasing is true of a name the predecessor defined."""
+        self.assertEqual(
+            self._lint(
+                "`Helper` is already imported or declared by `B04`.",
+                {"B04": "nothing at all"},
+            ),
+            [],
+        )
+
+    def test_an_absent_predecessor_is_not_judged(self) -> None:
+        """It may be a packet that has already merged and been cleaned up."""
+        self.assertEqual(
+            self._lint("`Whatever` is already imported by `Z99`.", {}), []
+        )
+
+    def test_prose_without_the_phrase_says_nothing(self) -> None:
+        self.assertEqual(
+            self._lint("`Widget` is this route's response_model.", {"B03": "x"}), []
+        )
 
 
 class InstallDeps(unittest.TestCase):
@@ -906,6 +1416,62 @@ class Allowlist(unittest.TestCase):
                 f"segment {segment.strip()!r} is not covered by Bash(uv run *)",
             )
 
+    def test_needs_db_is_translated_not_rejected(self) -> None:
+        """Every packet ever written carries the retired key, merged ones included.
+
+        `sync` re-reads the whole board, so refusing `needs_db` would break
+        every task that finished before the rename. It is translated to what it
+        always meant -- "also run `pytest -m db`" -- and the new spelling wins
+        where both appear.
+        """
+        def field(*lines: str) -> str:
+            text = VALID.replace(
+                'spec_path = "docs/SPEC.md"',
+                "\n".join(['spec_path = "d"', *lines]),
+            )
+            return parse(
+                write(Path(tempfile.mkdtemp()), "B01-example.md", text)
+            ).extra_pytest_marker
+
+        self.assertEqual(field("needs_db = true"), "db")
+        self.assertEqual(field("needs_db = false"), "")
+        self.assertEqual(field(), "")
+        self.assertEqual(field('extra_pytest_marker = "slow"'), "slow")
+        # The new key wins, including when it deliberately asks for nothing.
+        self.assertEqual(field("needs_db = true", 'extra_pytest_marker = ""'), "")
+
+    def test_the_db_segment_is_omitted_where_the_marker_is_not_registered(self) -> None:
+        """A verification step the worker cannot satisfy is worse than none.
+
+        `implement.md` hands `VERIFY_CMD` over with "fix what it reports". A
+        `-m db` run against a project that registers no `db` marker exits 5 on
+        every attempt, and the worker cannot register one — the project's
+        `pyproject.toml` is in `forbidden_paths` for every packet that sets the
+        flag. `gates.py` scoring the same run `skipped` is only half of it: the
+        gate becomes survivable and the instruction stays impossible.
+        """
+
+        class Pkt:
+            surface = "api"
+            extra_pytest_marker = "db"
+
+        with contextlib.ExitStack() as stack:
+            marker: dict[str, set[str] | None] = {"declared": {"slow", "manual"}}
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    run.gates, "declared_markers", lambda _: marker["declared"]
+                )
+            )
+            self.assertNotIn("-m db", run.verify_command(Pkt()))
+
+            marker["declared"] = {"slow", "manual", "db"}
+            self.assertIn("-m db", run.verify_command(Pkt()))
+
+            # Unanswerable keeps the old behaviour: a project configuring
+            # markers somewhere `declared_markers` does not read still gets it.
+            marker["declared"] = None
+            self.assertIn("-m db", run.verify_command(Pkt()))
+
     def test_the_implementer_gets_inspection_shell_plus_its_runner(self) -> None:
         for surface, runner in (("api", "uv run"), ("webapp", "npm run")):
             tools = agent.TOOLS_IMPL[surface]
@@ -1325,8 +1891,7 @@ class SharedCatalogue(unittest.TestCase):
                     self.assertIn(
                         slug,
                         defined,
-                        f"{path.name} cites `{slug}`; the catalogue does not "
-                        "define it",
+                        f"{path.name} cites `{slug}`; the catalogue does not define it",
                     )
 
 
@@ -1364,12 +1929,33 @@ class RealTasksDirectory(unittest.TestCase):
     """
 
     def test_the_real_tasks_directory_loads(self) -> None:
+        """That `load_all` gets through it, and returns packets rather than the
+        prose beside them.
+
+        It asserted a non-empty result until the queue legitimately emptied — a
+        cut's packets were retired unrun once the branch that cut them turned out
+        to have implemented them by hand. An empty queue is a state this harness
+        is supposed to have, so requiring packets here made a
+        deliberate act look like a broken loader. What the case is actually for
+        is the denylist: `tasks/` accumulated `CUT-REPORT.md`, then `RETIRED.md`,
+        and a loader that excluded non-packets by naming them one at a time broke
+        on each in turn.
+        """
         if not run.TASKS_DIR.is_dir():
             self.skipTest(
                 f"no {run.TASKS_DIR} — the harness is not vendored into a project"
             )
         packets = load_all(run.TASKS_DIR)
-        self.assertTrue(packets, "no packets found in the repository's tasks/")
+        for pkt in packets:
+            with self.subTest(packet=pkt.path.name):
+                self.assertTrue(is_packet_filename(pkt.path.name))
+        prose = {p.name for p in run.TASKS_DIR.glob("*.md")} - {
+            p.path.name for p in packets
+        }
+        self.assertFalse(
+            {n for n in prose if is_packet_filename(n)},
+            "a file named like a packet was not loaded as one",
+        )
 
     def test_the_factory_own_documents_are_not_packets(self) -> None:
         for name in ("README.md", "CUT-REPORT.md", "TRAPS.md", "GROUNDING.md"):
@@ -1489,6 +2075,49 @@ class Probes(unittest.TestCase):
         measured, probes = ground.probe_toolchain(self.repo, ["webapp"])
         self.assertEqual(measured, {})
         self.assertEqual(probes, [])
+
+    def _format_probe(self, returncode: int, output: str):
+        """`probe_toolchain` with the formatter's exit and output substituted."""
+        (self.repo / "api").mkdir(exist_ok=True)
+        (self.repo / "api" / "pyproject.toml").write_text("", encoding="utf-8")
+        completed = ground.subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout=output, stderr=""
+        )
+        with (
+            unittest.mock.patch.object(ground.shutil, "which", return_value="/bin/uv"),
+            unittest.mock.patch.object(
+                ground.subprocess, "run", return_value=completed
+            ),
+            unittest.mock.patch.object(
+                ground.gates, "measure_baseline", return_value={}
+            ),
+        ):
+            measured, probes = ground.probe_toolchain(self.repo, ["api"])
+        return measured, next(p for p in probes if p.name == "toolchain:format")
+
+    def test_a_formatter_that_could_not_run_is_not_a_clean_tree(self) -> None:
+        """The bug this is here for. `ruff format --check` exits non-zero because
+        files would be reformatted, so the exit code alone cannot distinguish a
+        red tree from a command that never ran -- and reading no count as zero
+        reported a missing binary as a clean tree, which is the exact shape of
+        claim this module exists to prevent.
+        """
+        measured, probe = self._format_probe(2, "error: Failed to spawn: `ruff`")
+        self.assertFalse(probe.ok)
+        self.assertNotIn("format_red_files", measured)
+        self.assertIn("did not run", probe.detail)
+
+    def test_a_red_tree_is_measured_not_failed(self) -> None:
+        measured, probe = self._format_probe(1, "12 files would be reformatted")
+        self.assertTrue(probe.ok)
+        self.assertEqual(measured["format_red_files"], 12)
+        self.assertIn("scoped to the diff", probe.detail)
+
+    def test_a_clean_tree_records_zero(self) -> None:
+        measured, probe = self._format_probe(0, "34 files already formatted")
+        self.assertTrue(probe.ok)
+        self.assertEqual(measured["format_red_files"], 0)
+        self.assertIn("tree is clean", probe.detail)
 
     def test_a_spec_without_history_cannot_be_pinned(self) -> None:
         (self.repo / "SPEC.md").write_text("x", encoding="utf-8")
@@ -1629,9 +2258,7 @@ class InterviewGuards(unittest.TestCase):
         grounded = ground.Grounding("2026-08-11", "abc", [])
         with unittest.mock.patch.object(run.sys.stdin, "isatty", return_value=True):
             self.assertFalse(run._should_interview(self._args(), grounded))
-            self.assertTrue(
-                run._should_interview(self._args(interview=True), grounded)
-            )
+            self.assertTrue(run._should_interview(self._args(interview=True), grounded))
 
 
 class Conventions(unittest.TestCase):
@@ -1912,13 +2539,173 @@ class Queue(unittest.TestCase):
                 "model": "basic",
                 "reviewer": "standard",
                 "gate": "auto",
-                "needs_db": False,
+                "extra_pytest_marker": "",
                 "surface": "api",
                 "max_attempts": 3,
                 "requires": requires,
             },
             ordinal=ordinal,
         )
+
+    def test_a_dirty_tree_does_not_spend_the_task_s_budget(self) -> None:
+        """The failure this pins: an attempt green-gated and review-accepted, then
+        `git merge --squash` refusing over files an operator was mid-edit on. The
+        task goes to `needs_work` and the next attempt re-does work that was
+        already right. The loop checks the tree is clean when it *claims*; the
+        merge happens an implementation, a gate and a review later.
+        """
+        self._add("M01", [], 0)
+        self.fac.claim_next()
+        attempt = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.assertEqual(self.fac.get("M01").attempts, 1)
+
+        self.fac.revert_attempt(
+            "M01", attempt, "merge blocked", agent_status="merge_blocked"
+        )
+
+        self.assertEqual(self.fac.get("M01").attempts, 0)
+
+    def test_the_cost_cap_bounds_this_run_and_not_the_project_s_history(self) -> None:
+        """A cap smaller than the board's lifetime spend must not refuse to start.
+
+        It did: the loop compared `--max-cost` against the lifetime total, so a
+        run on a board with any history printed `cost cap reached`, merged nothing
+        and exited 0. Nothing distinguished that from an empty queue.
+        """
+        self._add("M01", [], 0)
+        self.fac.claim_next()
+        old = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.fac.finish_attempt(old, cost_usd=431.84)
+
+        spent_before = self.fac.total_cost(billed_only=True)
+        self.assertAlmostEqual(spent_before, 431.84)
+        self.assertAlmostEqual(run.run_spend(self.fac, spent_before), 0.0)
+
+        # And it still bounds the run it is given: one more attempt's spend is
+        # what the cap sees, not the history it was added to.
+        new = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.fac.finish_attempt(new, cost_usd=5.0)
+        self.assertAlmostEqual(run.run_spend(self.fac, spent_before), 5.0)
+
+    def test_a_reverted_merge_keeps_the_record_that_the_work_was_good(self) -> None:
+        """`revert_attempt` hardcoded `agent_status="rate_limited"`. For a
+        blocked merge the model *did* run, the gate passed and the reviewer
+        accepted — writing `rate_limited` over that erases the only evidence."""
+        self._add("M01", [], 0)
+        self.fac.claim_next()
+        attempt = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.fac.revert_attempt(
+            "M01", attempt, "merge blocked", agent_status="merge_blocked"
+        )
+
+        row = self.fac.conn.execute(
+            "SELECT agent_status FROM attempts WHERE id=?", (attempt,)
+        ).fetchone()
+        self.assertEqual(row["agent_status"], "merge_blocked")
+
+    def test_a_rate_limit_still_reverts_as_a_rate_limit(self) -> None:
+        """The default is unchanged, so the original caller keeps its meaning."""
+        self._add("M01", [], 0)
+        self.fac.claim_next()
+        attempt = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.fac.revert_attempt("M01", attempt, "rate limited")
+
+        row = self.fac.conn.execute(
+            "SELECT agent_status FROM attempts WHERE id=?", (attempt,)
+        ).fetchone()
+        self.assertEqual(row["agent_status"], "rate_limited")
+
+    def test_the_reverted_attempt_row_survives_for_the_history(self) -> None:
+        self._add("M01", [], 0)
+        self.fac.claim_next()
+        attempt = self.fac.start_attempt(
+            "M01", model="sonnet", branch="task/M01", base_sha="abc", run_dir="d"
+        )
+        self.fac.revert_attempt(
+            "M01", attempt, "merge blocked", agent_status="merge_blocked"
+        )
+
+        self.assertEqual(self.fac.attempt_count("M01"), 1)
+
+    def test_a_gate_holds_its_own_packet_and_not_the_queue(self) -> None:
+        """`awaiting_human` used to return from the run loop entirely.
+
+        Independent packets sat idle through a review they had no dependency on,
+        which adds a human review turnaround to unrelated work for nothing.
+        """
+        self._add("H01", [], 0)
+        self._add("X01", [], 1)
+        self.fac.set_status("H01", "awaiting_human")
+
+        self.assertEqual(self.fac.claim_next().id, "X01")
+
+    def test_a_held_packet_is_not_reported_as_unreachable(self) -> None:
+        """The trap in letting the loop continue: on drain, `unreachable()`
+        would have called the held packet and its dependents stalled and
+        exited 1 — an ordinary hold reported as an error."""
+        self._add("H01", [], 0)
+        self._add("D01", ["H01"], 1)
+        self.fac.set_status("H01", "awaiting_human")
+
+        self.assertEqual(self.fac.unreachable(), [])
+
+    def test_a_blocked_dependency_is_still_unreachable(self) -> None:
+        """`blocked` needs a `reset`, which is a decision rather than a step,
+        so its dependents genuinely cannot run."""
+        self._add("B01", [], 0)
+        self._add("D01", ["B01"], 1)
+        self.fac.set_status("B01", "blocked")
+
+        self.assertEqual([i for i, _ in self.fac.unreachable()], ["D01"])
+
+    def test_a_missing_dependency_is_still_unreachable(self) -> None:
+        self._add("D01", ["NOPE"], 0)
+        self.assertEqual([i for i, _ in self.fac.unreachable()], ["D01"])
+
+    def test_a_cycle_is_still_detected(self) -> None:
+        """The fixpoint has to keep what `runnable_order` gave for free: two
+        tasks depending on each other never enter the reachable set."""
+        self._add("A01", ["B01"], 0)
+        self._add("B01", ["A01"], 1)
+
+        self.assertEqual(sorted(i for i, _ in self.fac.unreachable()), ["A01", "B01"])
+
+    def test_held_lists_the_gated_packets_in_queue_order(self) -> None:
+        self._add("H02", [], 1)
+        self._add("H01", [], 0)
+        self.fac.set_status("H01", "awaiting_human")
+        self.fac.set_status("H02", "awaiting_human")
+
+        self.assertEqual([t.id for t in self.fac.held()], ["H01", "H02"])
+
+    def test_waiting_on_reports_the_transitive_dependents(self) -> None:
+        """"Approving this releases three others" is what decides whether a
+        review happens now or after lunch."""
+        self._add("H01", [], 0)
+        self._add("D01", ["H01"], 1)
+        self._add("D02", ["D01"], 2)
+        self._add("U01", [], 3)
+        self.fac.set_status("H01", "awaiting_human")
+
+        self.assertEqual(self.fac.waiting_on({"H01"}), ["D01", "D02"])
+
+    def test_waiting_on_excludes_merged_dependents(self) -> None:
+        self._add("H01", [], 0)
+        self._add("D01", ["H01"], 1)
+        self.fac.set_status("H01", "awaiting_human")
+        self.fac.set_status("D01", "done")
+
+        self.assertEqual(self.fac.waiting_on({"H01"}), [])
 
     def test_a_task_is_not_handed_out_until_its_dependency_merges(self) -> None:
         self._add("S01", [], 0)
@@ -2073,7 +2860,7 @@ class Reset(unittest.TestCase):
                 "model": "basic",
                 "reviewer": "standard",
                 "gate": "human",
-                "needs_db": False,
+                "extra_pytest_marker": "",
                 "surface": "api",
                 "max_attempts": 3,
                 "requires": [],
@@ -2162,6 +2949,206 @@ class Reset(unittest.TestCase):
             rc = run.cmd_reset(self.fac, args)
         self.assertEqual(rc, 0)
         self.assertEqual(self.fac.get("B01").status, "ready")
+
+
+class PacketLint(unittest.TestCase):
+    """The mechanical checks that replaced model assessment on cheap packets.
+
+    Each test names the defect shape it was written for, because the value of
+    these checks is entirely empirical: most assessment verdicts come back
+    `recut`, and most of what those verdicts find needs no model to see.
+
+    Half of these tests assert *silence*. That is the load-bearing half — a lint
+    that reports a finding on a correct packet gets passed `--allow-unassessed`
+    once and then forever.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _packet(
+        self,
+        *,
+        invariant: str = "the thing is done",
+        body: str = "Body.",
+        inv_id: str = "one",
+    ) -> object:
+        text = VALID.replace('assert = "the thing is done"', f'assert = "{invariant}"')
+        text = (
+            text.replace('id = "one"', f'id = "{inv_id}"', 1)
+            if inv_id != "one"
+            else text
+        )
+        text = text.replace("\nBody.\n", f"\n{body}\n")
+        return parse(write(self.dir, "B01-example.md", text))
+
+    def _plant(self, rel: str, lines: int) -> None:
+        target = self.dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "\n".join(f"line {i}" for i in range(1, lines + 1)), encoding="utf-8"
+        )
+
+    # --- defect 1: a count stated twice, once wrong ---
+
+    def test_an_id_and_assert_that_disagree_on_a_count_are_reported(self) -> None:
+        """The shape: `...-the-six-attributes-...` over an assert enumerating
+        seven — a full assessment cycle to find, and free to check."""
+        pkt = self._packet(
+            inv_id="carries-the-six-attributes-provisioning-writes",
+            invariant="exactly seven attributes, no more",
+        )
+        findings = packetlint.check_restated_counts(pkt)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].check, "restated-count")
+        self.assertIn("[6]", str(findings[0]))
+        self.assertIn("[7]", str(findings[0]))
+
+    def test_an_id_and_assert_that_agree_are_silent(self) -> None:
+        pkt = self._packet(
+            inv_id="carries-the-seven-attributes-provisioning-writes",
+            invariant="exactly seven attributes, no more",
+        )
+        self.assertEqual(packetlint.check_restated_counts(pkt), [])
+
+    def test_an_assert_naming_several_counts_is_silent_if_one_matches(self) -> None:
+        """An assert legitimately mentions more than one count — three grounds,
+        seven attributes — and only one of them is the id's subject."""
+        pkt = self._packet(
+            inv_id="the-seven-attributes",
+            invariant="protection has three grounds; the item carries seven attributes",
+        )
+        self.assertEqual(packetlint.check_restated_counts(pkt), [])
+
+    def test_an_id_with_no_count_is_silent(self) -> None:
+        pkt = self._packet(
+            inv_id="the-item-is-replaced-whole", invariant="seven attributes, no more"
+        )
+        self.assertEqual(packetlint.check_restated_counts(pkt), [])
+
+    # --- defect 2: a citation past end-of-file, after a reformat ---
+
+    def test_a_citation_past_the_end_of_the_file_is_reported(self) -> None:
+        """A packet cites `api/routes/widgets.py:456`; reformatting later shortens
+        the file to 450 lines and orphans the citation."""
+        self._plant("api/routes/widgets.py", 450)
+        pkt = self._packet(body="See `api/routes/widgets.py:456` for the tail.")
+        findings = packetlint.check_citations_resolve(pkt, self.dir)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].check, "dead-citation")
+        self.assertIn("450 lines", str(findings[0]))
+
+    def test_a_citation_inside_the_file_is_silent(self) -> None:
+        self._plant("api/routes/widgets.py", 450)
+        pkt = self._packet(
+            body="See `api/routes/widgets.py:449` and `api/routes/widgets.py:1-450`."
+        )
+        self.assertEqual(packetlint.check_citations_resolve(pkt, self.dir), [])
+
+    def test_an_inverted_range_is_reported(self) -> None:
+        self._plant("api/x.py", 100)
+        pkt = self._packet(body="See `api/x.py:80-40`.")
+        findings = packetlint.check_citations_resolve(pkt, self.dir)
+        self.assertEqual([f.check for f in findings], ["dead-citation"])
+        self.assertIn("inverted", str(findings[0]))
+
+    def test_a_citation_naming_nothing_is_not_reported(self) -> None:
+        """Far more often a file the packet will create, an ambiguous basename,
+        or a dependency this checkout lacks than a real defect."""
+        pkt = self._packet(body="See `fastapi/routing.py:1193` and `nope/gone.py:12`.")
+        self.assertEqual(packetlint.check_citations_resolve(pkt, self.dir), [])
+
+    def test_a_basename_shorthand_resolves_to_its_unique_match(self) -> None:
+        """Packets give a full path once and shorten to a basename after."""
+        self._plant("api/tests/conftest.py", 140)
+        pkt = self._packet(
+            body="`conftest.py:108` seeds it; `conftest.py:900` does not exist."
+        )
+        findings = packetlint.check_citations_resolve(pkt, self.dir)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("900", str(findings[0]))
+
+    def test_an_ambiguous_basename_resolves_to_neither(self) -> None:
+        self._plant("a/dup.py", 10)
+        self._plant("b/dup.py", 10)
+        pkt = self._packet(body="See `dup.py:999`.")
+        self.assertEqual(packetlint.check_citations_resolve(pkt, self.dir), [])
+
+    # --- defect 3: a quotation the file does not contain ---
+
+    def test_a_quote_absent_from_the_cited_file_is_reported(self) -> None:
+        """A packet tells an implementer to delete "Nothing in this module writes"
+        from a file that never contained it."""
+        self._plant("api/settings/store.py", 20)
+        pkt = self._packet(
+            body="The docstring `api/settings/store.py:1-11` says "
+            '"nothing in this module ever writes anything" today.'
+        )
+        findings = packetlint.check_quoted_strings(pkt, self.dir)
+        self.assertEqual([f.check for f in findings], ["unattributed-quote"])
+
+    def test_a_quote_present_in_the_cited_file_is_silent(self) -> None:
+        target = self.dir / "api/settings/store.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            '"""Reading settings. Point reads, never a Scan."""\n', encoding="utf-8"
+        )
+        pkt = self._packet(
+            body="The docstring `api/settings/store.py:1` says "
+            '"Point reads, never a Scan" and stays true.'
+        )
+        self.assertEqual(packetlint.check_quoted_strings(pkt, self.dir), [])
+
+    def test_a_quote_inside_a_fenced_block_is_not_treated_as_a_quotation(self) -> None:
+        """Packets dictate the docstrings an implementer is to write. Dictated
+        text is not a quotation of anything, and reading it as one was this
+        check's loudest false positive."""
+        self._plant("api/store/client.py", 40)
+        pkt = self._packet(
+            body="Write this:\n\n```python\n"
+            'def f():\n    """The Widget table handle (`api/store/client.py:26-31`).\n\n'
+            '    "a sentence that is nowhere in the cited module at all"\n    """\n'
+            "```\n"
+        )
+        self.assertEqual(packetlint.check_quoted_strings(pkt, self.dir), [])
+
+    def test_a_short_quote_is_not_checked(self) -> None:
+        self._plant("api/x.py", 10)
+        pkt = self._packet(body='`api/x.py:3` says "not here at all yes".')
+        self.assertEqual(packetlint.check_quoted_strings(pkt, self.dir), [])
+
+    def test_an_elided_quote_is_not_checked(self) -> None:
+        self._plant("api/x.py", 10)
+        pkt = self._packet(
+            body='`api/x.py:3` says "some words here … and more words over there".'
+        )
+        self.assertEqual(packetlint.check_quoted_strings(pkt, self.dir), [])
+
+
+class AssessmentPolicy(unittest.TestCase):
+    """Which packets must be read by an assessor before they may be queued.
+
+    The policy is a spend decision: an assessment call costs several times an
+    implementation attempt, and `max_attempts` already detects the failure mode
+    assessment prevents.
+    """
+
+    def _packet(self, tier: str, gate: str) -> object:
+        return types.SimpleNamespace(tier=tier, gate=gate)
+
+    def test_advanced_tier_is_assessed(self) -> None:
+        self.assertTrue(run.needs_model_assessment(self._packet("advanced", "auto")))
+
+    def test_a_human_gate_is_assessed(self) -> None:
+        """The operator is about to spend the scarcest thing in the loop."""
+        self.assertTrue(run.needs_model_assessment(self._packet("standard", "human")))
+
+    def test_standard_and_basic_auto_packets_are_not(self) -> None:
+        for tier in ("basic", "standard"):
+            with self.subTest(tier=tier):
+                self.assertFalse(run.needs_model_assessment(self._packet(tier, "auto")))
 
 
 if __name__ == "__main__":

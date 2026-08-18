@@ -78,16 +78,36 @@ def spec_moved(repo: Path, spec_commit: str, spec_path: str) -> list[str]:
     the design. That doc was amended five times in two days and two amendments
     invalidated decisions a packet would already have carried, so this check is
     not paranoia — it is the reason packets record a commit at all.
+
+    Fails closed, and that is the whole reason both fields are checked before the
+    range is read. `git log bad-sha..HEAD` exits non-zero and prints nothing, and
+    an unknown pathspec prints nothing either; ignoring the exit code makes both
+    indistinguishable from "no commits touched the spec". A packet whose
+    `spec_commit` or `spec_path` is a typo would then pass the drift gate every
+    time and run with no spec checking at all, silently — the one failure this
+    check exists to prevent. Raising here blocks the task instead of exempting it.
     """
-    out = git(
-        "log",
-        "--oneline",
-        f"{spec_commit}..HEAD",
-        "--",
-        spec_path,
+    if not (repo / spec_path).is_file():
+        raise GitError(
+            f"spec_path `{spec_path}` is not a file in {repo} — a packet whose "
+            "spec of record does not exist cannot be drift-checked, and an "
+            "unreadable spec must not read as an unchanged one"
+        )
+    resolved = git(
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{spec_commit}^{{commit}}",
         cwd=repo,
         check=False,
-    )
+    ).strip()
+    if not resolved:
+        raise GitError(
+            f"spec_commit `{spec_commit}` does not resolve to a commit in {repo} "
+            "— the packet's pin is unreadable, so whether the spec moved cannot "
+            "be determined"
+        )
+    out = git("log", "--oneline", f"{spec_commit}..HEAD", "--", spec_path, cwd=repo)
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
